@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+uploads/
+.aistudio/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example

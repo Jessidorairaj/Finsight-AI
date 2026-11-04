@@ -1,0 +1,6 @@
+{
+  "name": "FinSight AI",
+  "description": "Personalized Expense Forecasting and Financial Intelligence Using Machine Learning and Generative AI",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
