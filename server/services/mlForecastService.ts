@@ -8,7 +8,7 @@
  * 3. High-availability TypeScript mathematical regression fallback
  */
 
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { FrontendTransaction } from '../repositories/transactionRepository.js';
@@ -118,8 +118,6 @@ export interface ForecastResponse {
   engineUsed?: 'scikit-learn' | 'python-fastapi' | 'python-subprocess' | 'typescript-fallback' | string;
 }
 
-const FASTAPI_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000/forecast';
-
 const MODEL_PRIORITY = [
   'Linear Regression',
   'Random Forest Regression',
@@ -127,8 +125,15 @@ const MODEL_PRIORITY = [
   'Naive Baseline'
 ];
 
+const FALLBACK_MODEL_PRIORITY = [
+  'Linear Regression (Fallback)',
+  'Autoregressive Blend (Fallback)',
+  'Moving Average (3-Month Fallback)',
+  'Naive Baseline (Fallback)',
+];
+
 /**
- * Attempts to fetch forecast from running FastAPI microservice.
+ * Attempts to fetch forecast from running FastAPI microservice if explicitly configured.
  */
 async function callFastApi(
   transactions: FrontendTransaction[],
@@ -136,12 +141,19 @@ async function callFastApi(
   targetEnd?: [number, number],
   currentMonth?: [number, number] | string
 ): Promise<ForecastResponse | null> {
+  const fastApiUrl = process.env.ML_SERVICE_URL;
+  if (!fastApiUrl) {
+    // In standard Render single-service deployment, Express directly executes forecast_engine.py
+    // via subprocess. Skip polling port 8000 when ML_SERVICE_URL is not explicitly configured.
+    return null;
+  }
+
   try {
-    console.log(`[FORECAST] Checking FastAPI forecasting service at ${FASTAPI_URL}...`);
+    console.log(`[FORECAST] Checking FastAPI forecasting service at ${fastApiUrl}...`);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
-    const res = await fetch(FASTAPI_URL, {
+    const res = await fetch(fastApiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ transactions, forecastHorizon, targetEnd, currentMonth }),
@@ -165,32 +177,156 @@ async function callFastApi(
 }
 
 /**
- * Finds the Python binary and environment on the local system.
+ * Resolves the appropriate Python binary for the current host environment
+ * (Render Linux, local Windows, or custom virtualenv).
  */
 function resolvePythonBinary(): { pythonBin: string; pythonHome?: string; pythonPath?: string } {
-  const candidateBins = [
-    {
-      bin: 'C:\\Python314\\python.exe',
-      home: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
-      path: [
-        'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
-        'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
-      ].join(path.delimiter),
-    },
-    {
-      bin: process.env.PYTHON_BIN || 'python',
-      home: process.env.PYTHONHOME,
-      path: process.env.PYTHONPATH,
-    },
+  // 1. Explicit user override via environment variable
+  if (process.env.PYTHON_BIN) {
+    return {
+      pythonBin: process.env.PYTHON_BIN,
+      pythonHome: process.env.PYTHONHOME,
+      pythonPath: process.env.PYTHONPATH,
+    };
+  }
+
+  // 2. Check local/virtualenv directories relative to project root
+  const projectRoot = process.cwd();
+  const venvPaths = [
+    path.join(projectRoot, '.venv', 'bin', 'python'),
+    path.join(projectRoot, '.venv', 'bin', 'python3'),
+    path.join(projectRoot, '.venv', 'Scripts', 'python.exe'),
+    '/opt/render/project/src/.venv/bin/python',
+    '/opt/render/project/src/.venv/bin/python3',
   ];
 
-  for (const c of candidateBins) {
-    if (fs.existsSync(c.bin)) {
-      return { pythonBin: c.bin, pythonHome: c.home, pythonPath: c.path };
+  for (const vp of venvPaths) {
+    if (fs.existsSync(vp)) {
+      return { pythonBin: vp };
     }
   }
 
-  return { pythonBin: 'python', pythonHome: undefined, pythonPath: undefined };
+  // 3. Platform-specific resolution
+  if (process.platform === 'win32') {
+    const winDevPath = 'C:\\Python314\\python.exe';
+    if (fs.existsSync(winDevPath)) {
+      return {
+        pythonBin: winDevPath,
+        pythonHome: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
+        pythonPath: [
+          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
+          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
+        ].join(path.delimiter),
+      };
+    }
+    return { pythonBin: 'python' };
+  }
+
+  // 4. Linux / Render production resolution
+  const linuxBins = [
+    '/usr/bin/python3',
+    '/usr/local/bin/python3',
+    '/usr/bin/python',
+    'python3',
+    'python',
+  ];
+
+  for (const lb of linuxBins) {
+    if (path.isAbsolute(lb) && fs.existsSync(lb)) {
+      return { pythonBin: lb };
+    }
+  }
+
+  return { pythonBin: 'python3' };
+}
+
+interface PythonVerificationResult {
+  ok: boolean;
+  pythonBin: string;
+  missingModules?: string[];
+  error?: string;
+  scikitLearnVersion?: string;
+  pandasVersion?: string;
+  numpyVersion?: string;
+}
+
+let cachedVerification: { result: PythonVerificationResult; timestamp: number } | null = null;
+
+/**
+ * Pre-flight verification that checks if required Python libraries (numpy, pandas, sklearn)
+ * can be imported into the active Python environment before invoking the forecast engine.
+ */
+function verifyPythonEnvironment(pythonBin: string, env: NodeJS.ProcessEnv): PythonVerificationResult {
+  const now = Date.now();
+  if (cachedVerification && (now - cachedVerification.timestamp < 30000)) {
+    return cachedVerification.result;
+  }
+
+  const checkCode = `import sys
+missing = []
+for mod in ['numpy', 'pandas', 'sklearn']:
+    try:
+        __import__(mod)
+    except ImportError:
+        missing.append(mod)
+
+if missing:
+    sys.stdout.write("MISSING:" + ",".join(missing) + "\\n")
+    sys.exit(1)
+else:
+    import numpy, pandas, sklearn
+    sys.stdout.write("OK:" + str(numpy.__version__) + ":" + str(pandas.__version__) + ":" + str(sklearn.__version__) + "\\n")
+`;
+
+  try {
+    const res = spawnSync(pythonBin, ['-c', checkCode], {
+      env,
+      timeout: 5000,
+      encoding: 'utf8',
+    });
+
+    const stdout = (res.stdout || '').trim();
+    const stderr = (res.stderr || '').trim();
+
+    if (res.status === 0 && stdout.startsWith('OK:')) {
+      const parts = stdout.split(':');
+      const vResult: PythonVerificationResult = {
+        ok: true,
+        pythonBin,
+        numpyVersion: parts[1],
+        pandasVersion: parts[2],
+        scikitLearnVersion: parts[3],
+      };
+      cachedVerification = { result: vResult, timestamp: now };
+      return vResult;
+    }
+
+    let missingModules: string[] = [];
+    if (stdout.startsWith('MISSING:')) {
+      missingModules = stdout.replace('MISSING:', '').split(',');
+    } else if (stderr.includes('No module named')) {
+      const match = stderr.match(/No module named ['"]([^'"]+)['"]/);
+      if (match) missingModules = [match[1]];
+    }
+
+    const errMessage = stderr || stdout || (res.error ? res.error.message : 'Unknown Python verification failure');
+    const vResult: PythonVerificationResult = {
+      ok: false,
+      pythonBin,
+      missingModules,
+      error: errMessage,
+    };
+    cachedVerification = { result: vResult, timestamp: now };
+    return vResult;
+  } catch (err: any) {
+    const vResult: PythonVerificationResult = {
+      ok: false,
+      pythonBin,
+      error: err?.message || 'Failed to spawn Python verification process',
+    };
+    cachedVerification = { result: vResult, timestamp: now };
+    return vResult;
+  }
 }
 
 /**
@@ -208,6 +344,7 @@ function callPythonSubprocess(
       const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
 
       if (!fs.existsSync(scriptPath)) {
+        console.error(`[FORECAST ERROR] Forecast engine script not found at ${scriptPath}`);
         return resolve(null);
       }
 
@@ -226,6 +363,22 @@ function callPythonSubprocess(
       }
       env.PYTHONPATH = paths.join(path.delimiter);
 
+      // Verify that Python and required libraries (numpy, pandas, sklearn) can be imported
+      const verification = verifyPythonEnvironment(pythonBin, env);
+      if (!verification.ok) {
+        console.error(`[FORECAST ERROR] Python dependency check failed for interpreter '${pythonBin}':`);
+        if (verification.missingModules && verification.missingModules.length > 0) {
+          console.error(`[FORECAST ERROR] Missing Python modules: ${verification.missingModules.join(', ')}`);
+        }
+        if (verification.error) {
+          console.error(`[FORECAST ERROR] Diagnostic details: ${verification.error}`);
+        }
+        console.error(`[FORECAST ERROR] Render Deployment Fix: In Render Dashboard -> Settings -> Build Command, update to:`);
+        console.error(`[FORECAST ERROR] -> pip install -r requirements.txt && npm install && npm run build`);
+        return resolve(null);
+      }
+
+      console.log(`[FORECAST] Python ML environment verified (NumPy ${verification.numpyVersion}, Pandas ${verification.pandasVersion}, Scikit-Learn ${verification.scikitLearnVersion}) using interpreter: ${pythonBin}`);
       console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${pythonBin})...`);
 
       const proc = spawn(pythonBin, [scriptPath, '-'], { env });
@@ -282,8 +435,8 @@ function callPythonSubprocess(
 
       proc.stdin.write(JSON.stringify({ transactions, forecastHorizon, targetEnd, currentMonth }));
       proc.stdin.end();
-    } catch (err) {
-      console.error('[ML Subprocess Catch Error]', err);
+    } catch (err: any) {
+      console.error('[FORECAST ERROR] Exception in callPythonSubprocess:', err?.message || err);
       resolve(null);
     }
   });
@@ -566,24 +719,24 @@ export function computeFallbackForecast(
 
   const nonZeroFoldsCount = rollingFolds.filter(k => series[k] > 0).length;
 
-  let bestModelName = MODEL_PRIORITY[0];
+  let bestModelName = FALLBACK_MODEL_PRIORITY[0];
   let valMaes: Record<string, number | null> = {
-    'Naive Baseline': null,
-    'Moving Average (3-Month)': null,
-    'Linear Regression': null,
-    'Random Forest Regression': null,
+    'Naive Baseline (Fallback)': null,
+    'Moving Average (3-Month Fallback)': null,
+    'Linear Regression (Fallback)': null,
+    'Autoregressive Blend (Fallback)': null,
   };
   let valRmses: Record<string, number | null> = {
-    'Naive Baseline': null,
-    'Moving Average (3-Month)': null,
-    'Linear Regression': null,
-    'Random Forest Regression': null,
+    'Naive Baseline (Fallback)': null,
+    'Moving Average (3-Month Fallback)': null,
+    'Linear Regression (Fallback)': null,
+    'Autoregressive Blend (Fallback)': null,
   };
   const allModelsValidation: Record<string, ValidationMetrics> = {};
 
   if (rollingFolds.length < 2) {
     const validationMessage = 'Fewer than 2 validation folds available in the evaluation period.';
-    for (const mName of MODEL_PRIORITY) {
+    for (const mName of FALLBACK_MODEL_PRIORITY) {
       allModelsValidation[mName] = {
         status: 'insufficient_folds',
         valMae: null,
@@ -596,10 +749,10 @@ export function computeFallbackForecast(
         message: validationMessage,
       };
     }
-    bestModelName = MODEL_PRIORITY[0];
+    bestModelName = FALLBACK_MODEL_PRIORITY[0];
   } else if (nonZeroFoldsCount === 0) {
     const validationMessage = 'All validation folds had zero expenses; validation error is uninformative for model discrimination.';
-    for (const mName of MODEL_PRIORITY) {
+    for (const mName of FALLBACK_MODEL_PRIORITY) {
       allModelsValidation[mName] = {
         status: 'all_zero_validation',
         valMae: null,
@@ -610,82 +763,79 @@ export function computeFallbackForecast(
         message: validationMessage,
       };
     }
-    bestModelName = MODEL_PRIORITY[0];
+    bestModelName = FALLBACK_MODEL_PRIORITY[0];
   } else {
     const foldErrorsNaive: number[] = [];
     const foldErrorsMa: number[] = [];
     const foldErrorsLr: number[] = [];
-    const foldErrorsRf: number[] = [];
+    const foldErrorsBlend: number[] = [];
 
     const foldSqNaive: number[] = [];
     const foldSqMa: number[] = [];
     const foldSqLr: number[] = [];
-    const foldSqRf: number[] = [];
+    const foldSqBlend: number[] = [];
 
     for (const origin of rollingFolds) {
       const yTarget = series[origin];
       const trainSlice = series.slice(0, origin);
       const { slope: fSlope, intercept: fIntercept } = fitLinear(trainSlice);
 
-      // 1. Naive Baseline: y_{t-1}
+      // 1. Naive Baseline (Fallback)
       const predNaive = series[origin - 1];
       const errNaive = Math.abs(yTarget - predNaive);
       foldErrorsNaive.push(errNaive);
       foldSqNaive.push(errNaive * errNaive);
 
-      // 2. Moving Average (3M)
+      // 2. Moving Average (Fallback)
       const window = series.slice(Math.max(0, origin - 3), origin);
       const predMa = window.reduce((a, b) => a + b, 0) / window.length;
       const errMa = Math.abs(yTarget - predMa);
       foldErrorsMa.push(errMa);
       foldSqMa.push(errMa * errMa);
 
-      // 3. Linear Regression
+      // 3. Linear Regression (Fallback)
       const predLr = Math.max(0, fIntercept + fSlope * origin);
       const errLr = Math.abs(yTarget - predLr);
       foldErrorsLr.push(errLr);
       foldSqLr.push(errLr * errLr);
 
-      // 4. Random Forest proxy
+      // 4. Autoregressive Blend (Fallback proxy)
       const lag1 = series[origin - 1];
       const lag2 = origin >= 2 ? series[origin - 2] : lag1;
-      const predRf = Math.max(0, 0.45 * lag1 + 0.35 * lag2 + 0.20 * (fIntercept + fSlope * origin));
-      const errRf = Math.abs(yTarget - predRf);
-      foldErrorsRf.push(errRf);
-      foldSqRf.push(errRf * errRf);
+      const predBlend = Math.max(0, 0.45 * lag1 + 0.35 * lag2 + 0.20 * (fIntercept + fSlope * origin));
+      const errBlend = Math.abs(yTarget - predBlend);
+      foldErrorsBlend.push(errBlend);
+      foldSqBlend.push(errBlend * errBlend);
     }
 
     const calcMean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
     const calcRmse = (sqArr: number[]) => Math.sqrt(sqArr.reduce((a, b) => a + b, 0) / sqArr.length);
 
     valMaes = {
-      'Naive Baseline': calcMean(foldErrorsNaive),
-      'Moving Average (3-Month)': calcMean(foldErrorsMa),
-      'Linear Regression': calcMean(foldErrorsLr),
-      'Random Forest Regression': calcMean(foldErrorsRf),
+      'Linear Regression (Fallback)': calcMean(foldErrorsLr),
+      'Autoregressive Blend (Fallback)': calcMean(foldErrorsBlend),
+      'Moving Average (3-Month Fallback)': calcMean(foldErrorsMa),
+      'Naive Baseline (Fallback)': calcMean(foldErrorsNaive),
     };
 
     valRmses = {
-      'Naive Baseline': calcRmse(foldSqNaive),
-      'Moving Average (3-Month)': calcRmse(foldSqMa),
-      'Linear Regression': calcRmse(foldSqLr),
-      'Random Forest Regression': calcRmse(foldSqRf),
+      'Linear Regression (Fallback)': calcRmse(foldSqLr),
+      'Autoregressive Blend (Fallback)': calcRmse(foldSqBlend),
+      'Moving Average (3-Month Fallback)': calcRmse(foldSqMa),
+      'Naive Baseline (Fallback)': calcRmse(foldSqNaive),
     };
 
-    // Model Selection Rule:
-    // 1. Lowest average validation MAE
-    // 2. Tie-breaker 1: Lowest validation RMSE
-    // 3. Tie-breaker 2: Documented deterministic priority rule (Linear > RF > MA > Naive)
+    // Model Selection Rule among Fallback Algorithms:
     const sortedModels = Object.keys(valMaes).sort((a, b) => {
       const diffMae = Math.round((valMaes[a] ?? 0) * 10000) - Math.round((valMaes[b] ?? 0) * 10000);
       if (diffMae !== 0) return diffMae;
       const diffRmse = Math.round((valRmses[a] ?? 0) * 10000) - Math.round((valRmses[b] ?? 0) * 10000);
       if (diffRmse !== 0) return diffRmse;
-      return MODEL_PRIORITY.indexOf(a) - MODEL_PRIORITY.indexOf(b);
+      return FALLBACK_MODEL_PRIORITY.indexOf(a) - FALLBACK_MODEL_PRIORITY.indexOf(b);
     });
     bestModelName = sortedModels[0];
 
-    for (const mName of MODEL_PRIORITY) {
+    for (const mName of FALLBACK_MODEL_PRIORITY) {
       allModelsValidation[mName] = {
         status: 'valid',
         valMae: Math.round((valMaes[mName] ?? 0) * 100) / 100,
@@ -714,12 +864,12 @@ export function computeFallbackForecast(
   for (let i = testStart; i < testEnd; i++) {
     testLrPreds.push(Math.max(0, preTestIntercept + preTestSlope * i));
   }
-  const testRfPreds: number[] = [];
+  const testBlendPreds: number[] = [];
   for (let i = testStart; i < testEnd; i++) {
     const lag1 = series[i - 1];
     const lag2 = i >= 2 ? series[i - 2] : lag1;
     const trend = preTestSlope * i + preTestIntercept;
-    testRfPreds.push(Math.max(0, 0.45 * lag1 + 0.35 * lag2 + 0.20 * trend));
+    testBlendPreds.push(Math.max(0, 0.45 * lag1 + 0.35 * lag2 + 0.20 * trend));
   }
 
   const calcTestMetrics = (preds: number[], modelKey: string): ModelMetrics => {
@@ -747,18 +897,18 @@ export function computeFallbackForecast(
   };
 
   const allModels: Record<string, ModelMetrics> = {
-    'Naive Baseline': calcTestMetrics(testNaivePreds, 'Naive Baseline'),
-    'Moving Average (3-Month)': calcTestMetrics(testMaPreds, 'Moving Average (3-Month)'),
-    'Linear Regression': calcTestMetrics(testLrPreds, 'Linear Regression'),
-    'Random Forest Regression': calcTestMetrics(testRfPreds, 'Random Forest Regression'),
+    'Naive Baseline (Fallback)': calcTestMetrics(testNaivePreds, 'Naive Baseline (Fallback)'),
+    'Moving Average (3-Month Fallback)': calcTestMetrics(testMaPreds, 'Moving Average (3-Month Fallback)'),
+    'Linear Regression (Fallback)': calcTestMetrics(testLrPreds, 'Linear Regression (Fallback)'),
+    'Autoregressive Blend (Fallback)': calcTestMetrics(testBlendPreds, 'Autoregressive Blend (Fallback)'),
   };
 
   const bestMetrics = allModels[bestModelName];
 
   const selectedTestPreds =
-    bestModelName === 'Naive Baseline' ? testNaivePreds :
-    bestModelName === 'Moving Average (3-Month)' ? testMaPreds :
-    bestModelName === 'Linear Regression' ? testLrPreds : testRfPreds;
+    bestModelName === 'Naive Baseline (Fallback)' ? testNaivePreds :
+    bestModelName === 'Moving Average (3-Month Fallback)' ? testMaPreds :
+    bestModelName === 'Linear Regression (Fallback)' ? testLrPreds : testBlendPreds;
 
   const testPeriodPoints: TestPeriodPoint[] = [];
   for (let i = 0; i < yTest.length; i++) {
@@ -774,7 +924,7 @@ export function computeFallbackForecast(
   }
 
   // Baseline comparison improvement calculation using MAE
-  const baselineMae = allModels['Naive Baseline'].mae;
+  const baselineMae = allModels['Naive Baseline (Fallback)'].mae;
   const selectedModelMae = bestMetrics.mae;
   let pctImprovement = 0.0;
   let improvementLabel = '';
@@ -829,12 +979,12 @@ export function computeFallbackForecast(
     const tIdx = numCompletedMonths + step - 1;
 
     let predVal = 0;
-    if (bestModelName === 'Linear Regression') {
+    if (bestModelName === 'Linear Regression (Fallback)') {
       predVal = fullIntercept + fullSlope * tIdx;
-    } else if (bestModelName === 'Moving Average (3-Month)') {
+    } else if (bestModelName === 'Moving Average (3-Month Fallback)') {
       const window = futureSeries.slice(-3);
       predVal = window.reduce((a, b) => a + b, 0) / window.length;
-    } else if (bestModelName === 'Random Forest Regression') {
+    } else if (bestModelName === 'Autoregressive Blend (Fallback)') {
       const lag1 = futureSeries[futureSeries.length - 1];
       const lag2 = futureSeries[futureSeries.length - 2] || lag1;
       predVal = 0.5 * lag1 + 0.3 * lag2 + 0.2 * (fullIntercept + fullSlope * tIdx);
@@ -872,7 +1022,7 @@ export function computeFallbackForecast(
     allModelsValidation,
     allModelsEvaluation: allModels,
     baselineComparison: {
-      baselineModel: 'Naive Baseline',
+      baselineModel: 'Naive Baseline (Fallback)',
       baselineMae,
       selectedModelMae,
       percentageImprovement: pctImprovement,
@@ -880,14 +1030,7 @@ export function computeFallbackForecast(
       isPositive: pctImprovement > 0,
       metricUsed: 'MAE',
     },
-    featureImportances: {
-      trend_t: 0.5526,
-      rolling_mean_3: 0.1942,
-      month_sin: 0.1064,
-      lag_1: 0.0961,
-      lag_2: 0.0460,
-      month_cos: 0.0047,
-    },
+    featureImportances: {},
     dataSummary: {
       totalCompletedMonths: numCompletedMonths,
       validationFoldsCount: rollingFolds.length,
@@ -907,9 +1050,9 @@ export function computeFallbackForecast(
       totalZeroExpenseMonths: zeroExpenseMonthsCount,
       selectionCriterion: 'Rolling-origin chronological validation average MAE (test set held out strictly for final evaluation)',
     },
-    message: 'Forecast generated successfully via scikit-learn compatible regression engine.',
+    message: 'Notice: Python Scikit-learn environment was unavailable on host; forecast was generated via TypeScript mathematical fallback. Install Python dependencies (numpy, pandas, scikit-learn) to enable genuine Scikit-learn Random Forest forecasting.',
     architecturalNotes:
-      'Deep learning sequence models (LSTM) are deliberately avoided: On monthly personal finance sequences (N < 50), LSTMs exhibit catastrophic overfitting and severe initialization variance. Scikit-learn tabular regression with rolling-origin chronological validation delivers strictly superior empirical generalization.',
+      'TypeScript Mathematical Fallback: Heuristic lag-trend regression executed in Node.js because the Python Scikit-learn environment was unavailable. Deploy with Python dependencies to run genuine RandomForestRegressor.',
     engineUsed: 'typescript-fallback',
   };
 }
