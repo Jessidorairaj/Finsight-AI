@@ -778,6 +778,7 @@ def run_forecasting_pipeline(
         "status": "ok",
         "modelUsed": best_model_name,
         "forecastHorizon": forecast_horizon,
+        "completedMonthsCount": num_completed_months,
         "currentMonthMtd": current_month_mtd,
         "historicalActuals": historical_actuals,
         "predictions": predictions,

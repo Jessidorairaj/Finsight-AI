@@ -217,7 +217,7 @@ interface VerifiedPythonEnvironment {
   pythonPath?: string;
 }
 
-let cachedVerifiedEnv: { env: VerifiedPythonEnvironment; timestamp: number } | null = null;
+let cachedVerifiedEnv: { env: VerifiedPythonEnvironment | null; timestamp: number } | null = null;
 
 /**
  * Pre-flight test script executed against candidate Python binaries.
@@ -297,20 +297,13 @@ async function findWorkingPythonEnvironmentAsync(): Promise<VerifiedPythonEnviro
 
   if (process.platform === 'win32') {
     // Windows developer candidates
-    const winDevPath = 'C:\\Python314\\python.exe';
-    if (fs.existsSync(winDevPath)) {
-      candidates.push({
-        bin: winDevPath,
-        home: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
-        path: [
-          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
-          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
-        ].join(path.delimiter),
-      });
-    }
     const appDataWin = 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\python.exe';
     if (fs.existsSync(appDataWin)) {
       candidates.push({ bin: appDataWin });
+    }
+    const winDevPath = 'C:\\Python314\\python.exe';
+    if (fs.existsSync(winDevPath)) {
+      candidates.push({ bin: winDevPath });
     }
     candidates.push({ bin: 'python' }, { bin: 'python3' }, { bin: 'py' });
     candidates.push({ bin: path.join(projectRoot, '.venv', 'Scripts', 'python.exe') });
@@ -423,6 +416,7 @@ async function findWorkingPythonEnvironmentAsync(): Promise<VerifiedPythonEnviro
   console.error(`[FORECAST ERROR] Render Deployment Fix: In Render Dashboard -> Settings -> Build Command, ensure:`);
   console.error(`[FORECAST ERROR] -> python3 -m pip install -r requirements.txt && npm install && npm run build:server && npm run db:migrate`);
 
+  cachedVerifiedEnv = { env: null, timestamp: Date.now() };
   return null;
 }
 
@@ -1217,6 +1211,7 @@ export async function generateUserForecast(
   finalResult.anomalies = anomalies;
 
   const completedCount = finalResult.completedMonthsCount || finalResult.dataSummary?.totalCompletedMonths || 0;
+  finalResult.completedMonthsCount = completedCount;
   const testSize = finalResult.dataSummary?.testMonths || 2;
   const trainSize = Math.max(0, completedCount - testSize);
   const valFolds = finalResult.dataSummary?.validationFoldsCount || 0;
