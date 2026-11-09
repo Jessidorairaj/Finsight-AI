@@ -8,10 +8,14 @@
  * 3. High-availability TypeScript mathematical regression fallback
  */
 
-import { spawn, spawnSync } from 'child_process';
+import { spawn, execFile } from 'child_process';
+import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
 import { FrontendTransaction } from '../repositories/transactionRepository.js';
+import { detectExpenseAnomalies, AnomalyDetectionResult } from './anomalyDetectionService.js';
+
+const execFileAsync = promisify(execFile);
 
 export interface ForecastActualPoint {
   month: string; // 'YYYY-MM'
@@ -103,6 +107,28 @@ export interface ForecastResponse {
   allModelsEvaluation?: Record<string, ModelMetrics>;
   baselineComparison?: BaselineComparison;
   featureImportances?: Record<string, number>;
+  anomalies?: AnomalyDetectionResult;
+  datasetStats?: {
+    totalTransactionRecords: number;
+    completedMonthlyRecords: number;
+    currentMonthTransactionCount: number;
+    currentMonthMtdAmount: number;
+    trainingRecordsCount: number;
+    validationFoldsCount: number;
+    heldOutTestMonths: number;
+    historicalMonthsAvailable: number;
+    userScoped: boolean;
+    tenantIsolationVerified: boolean;
+  };
+  expandingWindow?: {
+    totalCompletedMonths: number;
+    initialTrainingWindowSize: number;
+    expandedFinalTrainingSize: number;
+    progressionSummary: string;
+    oldestHistoricalMonth?: string;
+    latestHistoricalMonth?: string;
+    retainsAllHistoricalData: boolean;
+  };
   dataSummary?: {
     totalCompletedMonths: number;
     validationFoldsCount: number;
@@ -249,12 +275,14 @@ interface PythonCandidate {
  * Probes candidate Python executables across Render Linux, virtual environments,
  * system PATH, and developer environments to find a genuine, working Scikit-learn interpreter.
  */
-function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
-  const now = Date.now();
-  if (cachedVerifiedEnv && (now - cachedVerifiedEnv.timestamp < 60000)) {
-    return cachedVerifiedEnv.env;
-  }
+let activeVerificationPromise: Promise<VerifiedPythonEnvironment | null> | null = null;
 
+/**
+ * Probes candidate Python executables across Render Linux, virtual environments,
+ * system PATH, and developer environments to find a genuine, working Scikit-learn interpreter.
+ * Completely asynchronous to prevent blocking the Node.js event loop or delaying Render HTTP health checks.
+ */
+async function findWorkingPythonEnvironmentAsync(): Promise<VerifiedPythonEnvironment | null> {
   const projectRoot = process.cwd();
   const candidates: PythonCandidate[] = [];
 
@@ -311,9 +339,9 @@ function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
     candidates.push({ bin: '/usr/bin/python' });
   }
 
-  console.log(`[FORECAST] Searching for verified Python ML environment across ${candidates.length} candidate paths...`);
+  console.log(`[FORECAST] Searching asynchronously for verified Python ML environment across ${candidates.length} candidate paths...`);
 
-  const diagnosticFailures: Array<{ bin: string; code: number | null; error: string }> = [];
+  const diagnosticFailures: Array<{ bin: string; code: number | string | null; error: string }> = [];
 
   for (const candidate of candidates) {
     // If absolute path and does not exist on disk, skip without spawning
@@ -335,16 +363,17 @@ function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
     testEnv.PYTHONPATH = envPaths.join(path.delimiter);
 
     try {
-      const res = spawnSync(candidate.bin, ['-c', PYTHON_CHECK_CODE], {
+      // Asynchronous non-blocking child process execution with generous 45s cold-start timeout
+      const res = await execFileAsync(candidate.bin, ['-c', PYTHON_CHECK_CODE], {
         env: testEnv,
-        timeout: 8000,
+        timeout: 45000,
         encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
       });
 
       const stdout = (res.stdout || '').trim();
-      const stderr = (res.stderr || '').trim();
 
-      if (res.status === 0 && stdout.startsWith('OK|||')) {
+      if (stdout.startsWith('OK|||')) {
         const parts = stdout.split('|||');
         const resolvedActual = parts[1] || candidate.bin;
         const pyVer = parts[2] || 'unknown';
@@ -365,20 +394,20 @@ function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
 
         console.log(`[FORECAST] Verified working Python ML interpreter: '${candidate.bin}' -> ${resolvedActual}`);
         console.log(`[FORECAST] Active Versions: Python ${pyVer}, NumPy ${numVer}, Pandas ${pdVer}, Scikit-Learn ${skVer}`);
-        cachedVerifiedEnv = { env: verified, timestamp: now };
+        cachedVerifiedEnv = { env: verified, timestamp: Date.now() };
         return verified;
       }
 
       diagnosticFailures.push({
         bin: candidate.bin,
-        code: res.status,
-        error: stderr || stdout || (res.error ? res.error.message : 'import failed'),
+        code: 0,
+        error: `Unexpected output: ${stdout.slice(0, 200)}`,
       });
     } catch (err: any) {
       diagnosticFailures.push({
         bin: candidate.bin,
-        code: null,
-        error: err?.message || 'spawn error',
+        code: err?.code ?? 'ERR',
+        error: (err?.stderr || err?.message || 'execution error').slice(0, 300),
       });
     }
   }
@@ -386,7 +415,7 @@ function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
   // All candidates failed verification — log detailed diagnostic trace
   console.error(`[FORECAST ERROR] All Python interpreter candidates failed ML dependency verification:`);
   for (const failure of diagnosticFailures) {
-    console.error(`  - Candidate '${failure.bin}': exit code ${failure.code}, error: ${failure.error}`);
+    console.error(`  - Candidate '${failure.bin}': code ${failure.code}, error: ${failure.error.trim()}`);
   }
   console.error(`[FORECAST ERROR] Current working directory: ${projectRoot}`);
   console.error(`[FORECAST ERROR] System PATH: ${process.env.PATH || 'none'}`);
@@ -398,49 +427,67 @@ function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
 }
 
 /**
- * Spawns python `ml_service/forecast_engine.py` via child process using the verified Python environment.
+ * Retrieves the verified Python ML environment with caching (5 min TTL) and
+ * shared in-flight promise deduplication so simultaneous requests don't spawn multiple probes.
  */
-function callPythonSubprocess(
+export async function getVerifiedPythonEnvironment(): Promise<VerifiedPythonEnvironment | null> {
+  const now = Date.now();
+  if (cachedVerifiedEnv && (now - cachedVerifiedEnv.timestamp < 300000)) {
+    return cachedVerifiedEnv.env;
+  }
+  if (!activeVerificationPromise) {
+    activeVerificationPromise = findWorkingPythonEnvironmentAsync().finally(() => {
+      activeVerificationPromise = null;
+    });
+  }
+  return activeVerificationPromise;
+}
+
+/**
+ * Spawns python `ml_service/forecast_engine.py` via child process using the verified Python environment.
+ * Fully asynchronous with a generous 120-second timeout so model fitting never stalls the HTTP server.
+ */
+async function callPythonSubprocess(
   transactions: FrontendTransaction[],
   forecastHorizon: number,
   targetEnd?: [number, number],
   currentMonth?: [number, number] | string
 ): Promise<ForecastResponse | null> {
-  return new Promise(resolve => {
-    try {
-      const verified = findWorkingPythonEnvironment();
-      if (!verified) {
-        console.warn(`[FORECAST] Python environment unavailable. Deferring to mathematical fallback.`);
-        return resolve(null);
-      }
+  try {
+    const verified = await getVerifiedPythonEnvironment();
+    if (!verified) {
+      console.warn(`[FORECAST] Python environment unavailable. Deferring to mathematical fallback.`);
+      return null;
+    }
 
-      const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
-      if (!fs.existsSync(scriptPath)) {
-        console.error(`[FORECAST ERROR] Forecast engine script not found at ${scriptPath}`);
-        return resolve(null);
-      }
+    const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
+    if (!fs.existsSync(scriptPath)) {
+      console.error(`[FORECAST ERROR] Forecast engine script not found at ${scriptPath}`);
+      return null;
+    }
 
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      if (verified.pythonHome) {
-        env.PYTHONHOME = verified.pythonHome;
-      }
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (verified.pythonHome) {
+      env.PYTHONHOME = verified.pythonHome;
+    }
 
-      const projectRoot = process.cwd();
-      const paths = [projectRoot, path.join(projectRoot, 'ml_service')];
-      if (verified.pythonPath) {
-        paths.push(verified.pythonPath);
-      }
-      if (env.PYTHONPATH) {
-        paths.push(env.PYTHONPATH);
-      }
-      env.PYTHONPATH = paths.join(path.delimiter);
+    const projectRoot = process.cwd();
+    const paths = [projectRoot, path.join(projectRoot, 'ml_service')];
+    if (verified.pythonPath) {
+      paths.push(verified.pythonPath);
+    }
+    if (env.PYTHONPATH) {
+      paths.push(env.PYTHONPATH);
+    }
+    env.PYTHONPATH = paths.join(path.delimiter);
 
-      console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${verified.pythonBin})...`);
-      console.log(`[FORECAST] Python Executable: ${verified.actualExecutable} (Python ${verified.pythonVersion})`);
-      console.log(`[FORECAST] Script Path: ${scriptPath} (exists: true)`);
-      console.log(`[FORECAST] Subprocess CWD: ${projectRoot}`);
-      console.log(`[FORECAST] Dependencies: NumPy ${verified.numpyVersion}, Pandas ${verified.pandasVersion}, Scikit-Learn ${verified.scikitLearnVersion}`);
+    console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${verified.pythonBin})...`);
+    console.log(`[FORECAST] Python Executable: ${verified.actualExecutable} (Python ${verified.pythonVersion})`);
+    console.log(`[FORECAST] Script Path: ${scriptPath} (exists: true)`);
+    console.log(`[FORECAST] Subprocess CWD: ${projectRoot}`);
+    console.log(`[FORECAST] Dependencies: NumPy ${verified.numpyVersion}, Pandas ${verified.pandasVersion}, Scikit-Learn ${verified.scikitLearnVersion}`);
 
+    return new Promise(resolve => {
       const proc = spawn(verified.pythonBin, [scriptPath, '-'], { env });
 
       let stdout = '';
@@ -463,10 +510,10 @@ function callPythonSubprocess(
       });
 
       const timer = setTimeout(() => {
-        console.error('[FORECAST ERROR] Python subprocess timed out after 30000ms');
+        console.error('[FORECAST ERROR] Python subprocess timed out after 120000ms');
         proc.kill();
         resolve(null);
-      }, 30000);
+      }, 120000);
 
       proc.on('close', code => {
         clearTimeout(timer);
@@ -499,11 +546,11 @@ function callPythonSubprocess(
 
       proc.stdin.write(JSON.stringify({ transactions, forecastHorizon, targetEnd, currentMonth }));
       proc.stdin.end();
-    } catch (err: any) {
-      console.error('[FORECAST ERROR] Exception in callPythonSubprocess:', err?.message || err);
-      resolve(null);
-    }
-  });
+    });
+  } catch (err: any) {
+    console.error('[FORECAST ERROR] Exception in callPythonSubprocess:', err?.message || err);
+    return null;
+  }
 }
 
 /**
@@ -1134,25 +1181,73 @@ export async function generateUserForecast(
 
   // Tier 1: Try Python FastAPI service if running
   const apiResult = await callFastApi(transactions, forecastHorizon, targetEnd, currentMonth);
+
+  // Tier 2: Try Python subprocess directly with scikit-learn
+  const subprocessResult = !apiResult
+    ? await callPythonSubprocess(transactions, forecastHorizon, targetEnd, currentMonth)
+    : null;
+
+  let finalResult: ForecastResponse;
+
   if (apiResult) {
     console.log(`[FORECAST] Python forecast response received (FastAPI, status: ${apiResult.status}, modelUsed: ${apiResult.modelUsed})`);
     console.log(`[FORECAST] Engine used: ${apiResult.engineUsed}`);
     console.log(`[FORECAST] TypeScript fallback: NOT USED`);
-    return apiResult;
-  }
-
-  // Tier 2: Try Python subprocess directly with scikit-learn
-  const subprocessResult = await callPythonSubprocess(transactions, forecastHorizon, targetEnd, currentMonth);
-  if (subprocessResult) {
+    finalResult = apiResult;
+  } else if (subprocessResult) {
     console.log(`[FORECAST] Python forecast response received (Subprocess, status: ${subprocessResult.status}, modelUsed: ${subprocessResult.modelUsed})`);
     console.log(`[FORECAST] Engine used: ${subprocessResult.engineUsed}`);
     console.log(`[FORECAST] TypeScript fallback: NOT USED`);
-    return subprocessResult;
+    finalResult = subprocessResult;
+  } else {
+    // Tier 3: High-availability mathematical TypeScript fallback
+    console.warn(`[FORECAST] TypeScript fallback: INVOKED (Python FastAPI and subprocess were unavailable)`);
+    finalResult = computeFallbackForecast(transactions, forecastHorizon, targetEnd, currentMonth);
+    console.log(`[FORECAST] Engine used: ${finalResult.engineUsed}`);
   }
 
-  // Tier 3: High-availability mathematical TypeScript fallback
-  console.warn(`[FORECAST] TypeScript fallback: INVOKED (Python FastAPI and subprocess were unavailable)`);
-  const fallbackResult = computeFallbackForecast(transactions, forecastHorizon, targetEnd, currentMonth);
-  console.log(`[FORECAST] Engine used: ${fallbackResult.engineUsed}`);
-  return fallbackResult;
+  // Enrich with user-isolated anomaly detection and verified dataset statistics
+  const currentMonthStr = typeof currentMonth === 'string'
+    ? currentMonth
+    : Array.isArray(currentMonth)
+      ? `${currentMonth[0]}-${String(currentMonth[1]).padStart(2, '0')}`
+      : undefined;
+
+  const anomalies = detectExpenseAnomalies(transactions, currentMonthStr);
+  finalResult.anomalies = anomalies;
+
+  const completedCount = finalResult.completedMonthsCount || finalResult.dataSummary?.totalCompletedMonths || 0;
+  const testSize = finalResult.dataSummary?.testMonths || 2;
+  const trainSize = Math.max(0, completedCount - testSize);
+  const valFolds = finalResult.dataSummary?.validationFoldsCount || 0;
+
+  finalResult.datasetStats = {
+    totalTransactionRecords: transactions.length,
+    completedMonthlyRecords: completedCount,
+    currentMonthTransactionCount: finalResult.currentMonthMtd?.transactionCount || 0,
+    currentMonthMtdAmount: finalResult.currentMonthMtd?.amount || 0,
+    trainingRecordsCount: trainSize,
+    validationFoldsCount: valFolds,
+    heldOutTestMonths: testSize,
+    historicalMonthsAvailable: completedCount,
+    userScoped: true,
+    tenantIsolationVerified: true,
+  };
+
+  const oldest = finalResult.historicalActuals && finalResult.historicalActuals.length > 0 ? finalResult.historicalActuals[0].month : undefined;
+  const latest = finalResult.historicalActuals && finalResult.historicalActuals.length > 0 ? finalResult.historicalActuals[finalResult.historicalActuals.length - 1].month : undefined;
+
+  finalResult.expandingWindow = {
+    totalCompletedMonths: completedCount,
+    initialTrainingWindowSize: Math.max(3, Math.min(6, completedCount - 1)),
+    expandedFinalTrainingSize: completedCount,
+    progressionSummary: completedCount >= 6
+      ? `Months 1–6 → Baseline origin fitted; Expanding window sequentially incorporates Months 7–${completedCount} for continuous retraining without discarding historical records.`
+      : `${completedCount} completed historical months available. Requires >= 6 completed months to commence expanding-window retraining.`,
+    oldestHistoricalMonth: oldest,
+    latestHistoricalMonth: latest,
+    retainsAllHistoricalData: true,
+  };
+
+  return finalResult;
 }

@@ -1060,6 +1060,24 @@ export const api = {
     }
   },
 
+  // 11. Expenditure Anomaly Detection
+  async getAnomalies(currentMonth?: string): Promise<{ success: boolean; data?: any; error?: string }> {
+    try {
+      const url = currentMonth ? `/api/anomalies?currentMonth=${currentMonth}` : '/api/anomalies';
+      const res = await fetch(getApiUrl(url), {
+        headers: getAuthHeaders(),
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        return { success: false, error: data.message || 'Failed to fetch expenditure anomalies.' };
+      }
+      return { success: true, data };
+    } catch {
+      return { success: false, error: 'Failed to connect to anomaly detection service.' };
+    }
+  },
+
   // 9. Conversational Financial Intelligence API (Grounded Chatbot)
   async sendChatMessage(
     message: string,

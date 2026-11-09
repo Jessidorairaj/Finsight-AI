@@ -19,6 +19,8 @@ import { billsRouter } from './server/routes/bills';
 import { recurringTransactionsRouter } from './server/routes/recurringTransactions';
 import { documentsRouter } from './server/routes/documents';
 import { forecastRouter } from './server/routes/forecast';
+import { anomalyRouter } from './server/routes/anomalies';
+import { getVerifiedPythonEnvironment } from './server/services/mlForecastService';
 import { authRouter } from './server/routes/auth';
 import { adminRouter } from './server/routes/admin';
 import { chatRouter } from './server/routes/chat';
@@ -178,6 +180,7 @@ async function startServer() {
   app.use('/api/recurring-transactions', recurringTransactionsRouter);
   app.use('/api/documents', documentsRouter);
   app.use('/api/forecast', forecastRouter);
+  app.use('/api/anomalies', anomalyRouter);
   app.use('/api/admin', adminRouter);
   app.use('/api/chat', chatRouter);
 
@@ -276,6 +279,11 @@ async function startServer() {
     console.log(`  ➜  Local:   http://localhost:${PORT}/`);
     console.log(`  ➜  Network: http://0.0.0.0:${PORT}/`);
     console.log(`\nFinSight AI server listening on http://0.0.0.0:${PORT}\n`);
+
+    // Kick off asynchronous non-blocking Python ML environment warm-up in background
+    getVerifiedPythonEnvironment().catch((err: any) => {
+      console.log('[STARTUP] Background Python verification notice:', err?.message || err);
+    });
   });
 
   const shutdown = () => {

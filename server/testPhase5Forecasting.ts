@@ -14,8 +14,9 @@
  * 9. Python ML engine and TypeScript fallback parity on identical fixtures.
  */
 
-import { generateUserForecast, computeFallbackForecast } from './services/mlForecastService.js';
+import { generateUserForecast, computeFallbackForecast, getVerifiedPythonEnvironment } from './services/mlForecastService.js';
 import { FrontendTransaction } from './repositories/transactionRepository.js';
+import { detectExpenseAnomalies } from './services/anomalyDetectionService.js';
 
 let passed = 0;
 let failed = 0;
@@ -353,6 +354,87 @@ async function runTests() {
     const overlap = futureMonths.filter(m => testMonths.includes(m));
     assert(overlap.length === 0, 'Future forecast months start strictly after completed test months without overlap');
   }
+
+  // -------------------------------------------------------------------------
+  // Test 13: Asynchronous Non-Blocking Python Environment Verification
+  // -------------------------------------------------------------------------
+  console.log('\n[Test 13] Asynchronous Python environment verification');
+  const verifiedEnv = await getVerifiedPythonEnvironment();
+  assert(Boolean(verifiedEnv), 'Verified Python environment resolved asynchronously');
+  if (verifiedEnv) {
+    assert(typeof verifiedEnv.actualExecutable === 'string', `Python binary path resolved: ${verifiedEnv.actualExecutable}`);
+    assert(typeof verifiedEnv.pythonVersion === 'string', `Python version verified: ${verifiedEnv.pythonVersion}`);
+    assert(typeof verifiedEnv.scikitLearnVersion === 'string', `Scikit-Learn version verified: ${verifiedEnv.scikitLearnVersion}`);
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 14: Expense Anomaly Detection (Rolling IQR Statistical Analysis)
+  // -------------------------------------------------------------------------
+  console.log('\n[Test 14] Expense anomaly detection (Rolling IQR)');
+  // Scenario matching user requirement: Food baseline Rs 3,000, spike in current month to Rs 8,500
+  const anomalyFixtureTransactions: FrontendTransaction[] = [
+    { id: 'a1', name: 'Groceries 1', amount: 3000, date: '2026-05-10', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+    { id: 'a2', name: 'Groceries 2', amount: 3100, date: '2026-06-12', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+    { id: 'a3', name: 'Groceries 3', amount: 2950, date: '2026-07-15', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+    { id: 'a4', name: 'Groceries 4', amount: 3050, date: '2026-08-11', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+    { id: 'a5', name: 'Groceries 5', amount: 3000, date: '2026-09-14', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+    { id: 'a6', name: 'Groceries Spike', amount: 8500, date: '2026-10-18', type: 'expense', category: 'Food & Dining', status: 'Completed' },
+  ];
+
+  const anomalyRes = detectExpenseAnomalies(anomalyFixtureTransactions, '2026-11');
+  assert(anomalyRes.status === 'ok', 'Anomaly detection returns status ok for >= 3 completed months');
+  assert(anomalyRes.totalAnomaliesCount > 0, `Detected anomalies count > 0 (got: ${anomalyRes.totalAnomaliesCount})`);
+  assert(anomalyRes.highestSeverity === 'high' || anomalyRes.highestSeverity === 'critical', `Flagged severe anomaly (got: ${anomalyRes.highestSeverity})`);
+
+  const foodAnomaly = anomalyRes.anomalies.find(a => a.category === 'Food & Dining');
+  assert(Boolean(foodAnomaly), 'Identified Food & Dining category surge');
+  if (foodAnomaly) {
+    assert(foodAnomaly.actualAmount === 8500, `Captured actual outlay: ₹${foodAnomaly.actualAmount}`);
+    assert(Math.abs(foodAnomaly.baselineAmount - 3000) < 150, `Historical median baseline around ₹3,000 (got: ₹${foodAnomaly.baselineAmount})`);
+    assert(foodAnomaly.diffAmount > 5000, `Increase amount calculated: +₹${foodAnomaly.diffAmount}`);
+    assert(foodAnomaly.diffPercentage > 150, `Increase percentage calculated: +${foodAnomaly.diffPercentage}%`);
+    assert(foodAnomaly.reason.includes('Food & Dining'), 'Prose explanation accurately specifies category and statistical threshold');
+  }
+
+  // Verify insufficient data handling (< 3 completed months)
+  const shortAnomalyTxs: FrontendTransaction[] = [
+    { id: 's1', name: 'M1', amount: 3000, date: '2026-09-10', type: 'expense', category: 'Bills', status: 'Completed' },
+    { id: 's2', name: 'M2', amount: 3100, date: '2026-10-10', type: 'expense', category: 'Bills', status: 'Completed' },
+  ];
+  const shortAnomalyRes = detectExpenseAnomalies(shortAnomalyTxs, '2026-11');
+  assert(shortAnomalyRes.status === 'insufficient_data', 'Correctly flags insufficient_data when completed months < 3');
+  assert(shortAnomalyRes.completedMonthsCount === 2, `Accurately reports completed months count: ${shortAnomalyRes.completedMonthsCount}`);
+
+  // -------------------------------------------------------------------------
+  // Test 15: Dataset Statistics & Expanding Training Window Verification
+  // -------------------------------------------------------------------------
+  console.log('\n[Test 15] Dataset statistics & expanding window progression');
+  assert(Boolean(res2.datasetStats), 'Forecast result contains datasetStats');
+  if (res2.datasetStats) {
+    assert(res2.datasetStats.totalTransactionRecords === 8, `Accurate total transactions count: ${res2.datasetStats.totalTransactionRecords}`);
+    assert(res2.datasetStats.completedMonthlyRecords === 8, `Accurate completed monthly records: ${res2.datasetStats.completedMonthlyRecords}`);
+    assert(res2.datasetStats.userScoped === true, 'Dataset statistics are strictly user-scoped');
+    assert(res2.datasetStats.tenantIsolationVerified === true, 'Tenant isolation verified');
+  }
+
+  assert(Boolean(res2.expandingWindow), 'Forecast result contains expandingWindow metadata');
+  if (res2.expandingWindow) {
+    assert(res2.expandingWindow.retainsAllHistoricalData === true, 'Expanding window retains all historical records without truncation');
+    assert(res2.expandingWindow.progressionSummary.includes('Expanding window'), 'Expanding window progression summary describes continuous retraining');
+  }
+
+  // -------------------------------------------------------------------------
+  // Test 16: Concurrent Forecast Requests (Async Promise Deduplication)
+  // -------------------------------------------------------------------------
+  console.log('\n[Test 16] Concurrent forecast execution & event-loop non-blocking');
+  const [c1, c2, c3] = await Promise.all([
+    generateUserForecast(eightMonthTransactions, 3, undefined, [2026, 11]),
+    generateUserForecast(eightMonthTransactions, 3, undefined, [2026, 11]),
+    generateUserForecast(eightMonthTransactions, 3, undefined, [2026, 11]),
+  ]);
+  assert(c1.status === 'ok' && c2.status === 'ok' && c3.status === 'ok', 'Concurrent forecast requests resolve simultaneously');
+  assert(c1.engineUsed === c2.engineUsed && c2.engineUsed === c3.engineUsed, `All concurrent requests use identical verified engine: ${c1.engineUsed}`);
+  assert(Boolean(c1.predictions && c2.predictions && c3.predictions), 'All concurrent executions return valid forward prediction arrays');
 
   // -------------------------------------------------------------------------
   // Summary

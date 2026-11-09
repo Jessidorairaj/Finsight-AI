@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   Wallet,
@@ -44,6 +44,7 @@ import { useFinancial } from '../context/FinancialContext';
 import { AskAIBar } from '../components/AskAIBar';
 import { Bill } from '../data/mockData';
 import { formatStandardDate } from '../utils/dateUtils';
+import { api } from '../services/api';
 
 export const Dashboard: React.FC = () => {
   const { theme } = useTheme();
@@ -110,6 +111,18 @@ export const Dashboard: React.FC = () => {
   const [isBillRecoveryModalOpen, setIsBillRecoveryModalOpen] = useState(false);
   const [isImportingBills, setIsImportingBills] = useState(false);
   const [billRecoveryError, setBillRecoveryError] = useState<string | null>(null);
+
+  const [anomalyData, setAnomalyData] = useState<any>(null);
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      api.getAnomalies().then(res => {
+        if (res.success && res.data) {
+          setAnomalyData(res.data);
+        }
+      }).catch(() => {});
+    }
+  }, [isAuthenticated, transactions.length]);
 
   const activeTrendData = spendingTrendDatasets[trendRange];
   const isDark = theme === 'dark';
@@ -852,7 +865,26 @@ export const Dashboard: React.FC = () => {
                   <Sparkles className="w-4 h-4" />
                   <span>AI Insight</span>
                 </div>
-                {transactions.length === 0 || !categoryBreakdown[0] ? (
+                {anomalyData && anomalyData.anomalies && anomalyData.anomalies.length > 0 ? (
+                  <>
+                    <div className="flex items-center gap-1.5 mb-1.5">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                        {anomalyData.anomalies[0].severity} Anomaly
+                      </span>
+                      <span className="text-xs text-slate-400 font-semibold">{anomalyData.anomalies[0].month}</span>
+                    </div>
+                    <p className="text-xs text-slate-300 leading-relaxed line-clamp-3">
+                      {anomalyData.anomalies[0].reason}
+                    </p>
+                    <Link
+                      to="/forecast"
+                      className="mt-3 text-xs font-semibold text-[#00E5BE] hover:underline inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <span>Inspect in Forecast & Anomaly Hub</span>
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    </Link>
+                  </>
+                ) : transactions.length === 0 || !categoryBreakdown[0] ? (
                   <p className="text-xs text-slate-400 leading-relaxed">
                     AI spending anomaly detection and category insights will activate automatically as soon as your statements or transactions are uploaded.
                   </p>

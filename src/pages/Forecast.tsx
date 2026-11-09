@@ -3,6 +3,7 @@ import {
   Sparkles,
   Sliders,
   AlertCircle,
+  AlertTriangle,
   Info,
   CheckCircle2,
   RefreshCw,
@@ -14,7 +15,10 @@ import {
   Calendar,
   ChevronDown,
   ChevronUp,
-  Table as TableIcon
+  Table as TableIcon,
+  ShieldAlert,
+  Database,
+  Layers
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -121,6 +125,49 @@ interface ForecastResponseData {
   allModelsEvaluation?: Record<string, ModelMetrics>;
   baselineComparison?: BaselineComparison;
   featureImportances?: Record<string, number>;
+  anomalies?: {
+    status: 'ok' | 'insufficient_data';
+    anomalies: Array<{
+      id: string;
+      type: 'total_spending_spike' | 'category_unusual_spend';
+      category?: string;
+      month: string;
+      actualAmount: number;
+      baselineAmount: number;
+      normalUpperThreshold: number;
+      diffAmount: number;
+      diffPercentage: number;
+      severity: 'low' | 'medium' | 'high' | 'critical';
+      reason: string;
+    }>;
+    totalAnomaliesCount: number;
+    highestSeverity: 'low' | 'medium' | 'high' | 'critical' | 'none';
+    evaluatedPeriod: string;
+    completedMonthsCount: number;
+    summary: string;
+    categoryBreakdown: Record<string, any>;
+  };
+  datasetStats?: {
+    totalTransactionRecords: number;
+    completedMonthlyRecords: number;
+    currentMonthTransactionCount: number;
+    currentMonthMtdAmount: number;
+    trainingRecordsCount: number;
+    validationFoldsCount: number;
+    heldOutTestMonths: number;
+    historicalMonthsAvailable: number;
+    userScoped: boolean;
+    tenantIsolationVerified: boolean;
+  };
+  expandingWindow?: {
+    totalCompletedMonths: number;
+    initialTrainingWindowSize: number;
+    expandedFinalTrainingSize: number;
+    progressionSummary: string;
+    oldestHistoricalMonth?: string;
+    latestHistoricalMonth?: string;
+    retainsAllHistoricalData: boolean;
+  };
   dataSummary?: {
     totalCompletedMonths?: number;
     totalHistoricalMonths?: number;
@@ -528,6 +575,189 @@ export const Forecast: React.FC = () => {
                   </span>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Expense Anomaly Detection Banner (Rolling IQR Statistical Analysis) */}
+          {forecastState.anomalies && (
+            <div
+              className={`p-5 rounded-2xl border ${
+                forecastState.anomalies.totalAnomaliesCount > 0
+                  ? isDark
+                    ? 'bg-amber-950/20 border-amber-500/40'
+                    : 'bg-amber-50 border-amber-300'
+                  : isDark
+                    ? 'bg-emerald-950/15 border-emerald-500/30'
+                    : 'bg-emerald-50 border-emerald-200'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                <div className="flex items-center gap-2">
+                  {forecastState.anomalies.totalAnomaliesCount > 0 ? (
+                    <ShieldAlert className="w-5 h-5 text-amber-400 shrink-0" />
+                  ) : (
+                    <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                  )}
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      Expense Anomaly Detection (Rolling IQR Statistical Analysis)
+                      <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-slate-800 text-slate-300 border border-slate-700">
+                        Evaluated Period: {forecastState.anomalies.evaluatedPeriod}
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      {forecastState.anomalies.summary}
+                    </p>
+                  </div>
+                </div>
+
+                {forecastState.anomalies.totalAnomaliesCount > 0 && (
+                  <span
+                    className={`text-xs px-2.5 py-1 rounded-full font-bold uppercase tracking-wider ${
+                      forecastState.anomalies.highestSeverity === 'critical'
+                        ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                        : forecastState.anomalies.highestSeverity === 'high'
+                          ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
+                          : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                    }`}
+                  >
+                    Highest Severity: {forecastState.anomalies.highestSeverity}
+                  </span>
+                )}
+              </div>
+
+              {forecastState.anomalies.totalAnomaliesCount > 0 ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                  {forecastState.anomalies.anomalies.map((anom) => (
+                    <div
+                      key={anom.id}
+                      className={`p-3.5 rounded-xl border text-xs space-y-1.5 ${
+                        isDark ? 'bg-black/30 border-slate-800' : 'bg-white border-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-white flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                          {anom.category ? `${anom.category} Surge` : 'Total Spending Spike'} ({anom.month})
+                        </span>
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                            anom.severity === 'critical'
+                              ? 'bg-red-500/20 text-red-400'
+                              : anom.severity === 'high'
+                                ? 'bg-orange-500/20 text-orange-400'
+                                : 'bg-amber-500/20 text-amber-400'
+                          }`}
+                        >
+                          {anom.severity}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 py-1 text-[11px] border-y border-slate-800/60">
+                        <div>
+                          <span className="text-slate-400 block text-[10px]">Actual Outlay</span>
+                          <span className="font-bold text-white">₹{anom.actualAmount.toLocaleString('en-IN')}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 block text-[10px]">Median Baseline</span>
+                          <span className="font-medium text-slate-300">₹{anom.baselineAmount.toLocaleString('en-IN')}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-400 block text-[10px]">Increase</span>
+                          <span className="font-bold text-amber-400">+{anom.diffPercentage}% (+₹{anom.diffAmount.toLocaleString('en-IN')})</span>
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-slate-400 leading-relaxed pt-0.5">
+                        {anom.reason}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-xs text-emerald-400 pt-1 font-medium">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>Personal expenses remained within normal statistical limits (Q3 + 1.5×IQR). No anomalous spikes detected.</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Dataset Statistics & Expanding Training Window Section */}
+          {forecastState.datasetStats && (
+            <div
+              className={`p-5 rounded-2xl border ${
+                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div className="flex items-center gap-2">
+                  <Database className="w-5 h-5 text-cyan-400" />
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      Personal Dataset Statistics & Expanding Training Window
+                      <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                        Tenant-Isolated PostgreSQL Data
+                      </span>
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Exclusively derived from authenticated personal financial transactions (no external or synthetic datasets).
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 4 Data Tiles */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-black/20 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
+                    Total Transactions
+                  </span>
+                  <p className="text-lg font-bold text-white mt-1">
+                    {forecastState.datasetStats.totalTransactionRecords}
+                  </p>
+                  <span className="text-[10px] text-slate-400">PostgreSQL ledger records</span>
+                </div>
+
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-black/20 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
+                    Completed Months
+                  </span>
+                  <p className="text-lg font-bold text-white mt-1">
+                    {forecastState.datasetStats.completedMonthlyRecords}
+                  </p>
+                  <span className="text-[10px] text-slate-400">Continuous aggregated months</span>
+                </div>
+
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-black/20 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
+                    Training & Validation
+                  </span>
+                  <p className="text-lg font-bold text-cyan-400 mt-1">
+                    {forecastState.datasetStats.trainingRecordsCount} Months ({forecastState.datasetStats.validationFoldsCount} Folds)
+                  </p>
+                  <span className="text-[10px] text-slate-400">Rolling walk-forward folds</span>
+                </div>
+
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-black/20 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
+                    Held-Out Test Split
+                  </span>
+                  <p className="text-lg font-bold text-amber-400 mt-1">
+                    {forecastState.datasetStats.heldOutTestMonths} Months
+                  </p>
+                  <span className="text-[10px] text-slate-400">Untouched for final evaluation</span>
+                </div>
+              </div>
+
+              {/* Expanding Window Timeline Notice */}
+              {forecastState.expandingWindow && (
+                <div className="mt-3.5 p-3 rounded-xl bg-slate-800/40 border border-slate-800 text-xs flex items-center gap-2.5">
+                  <Layers className="w-4 h-4 text-[#00E5BE] shrink-0" />
+                  <p className="text-slate-300 text-[11px] leading-relaxed">
+                    <span className="font-bold text-white mr-1">Expanding Window Methodology:</span>
+                    {forecastState.expandingWindow.progressionSummary}
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -1188,6 +1418,41 @@ export const Forecast: React.FC = () => {
                   <p className="text-slate-400">
                     Deep Recurrent Neural Networks (LSTM) require hundreds or thousands of sequence steps to parameterize recurrent gates. On typical personal expense histories of 6–36 months, LSTMs catastrophically overfit and lack explainability. Regularized tabular regression delivers superior held-out accuracy and deterministic inference.
                   </p>
+                </div>
+
+                <div className="p-3 rounded-xl bg-slate-500/10">
+                  <p className="font-bold text-[#00E5BE] mb-0.5 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-[#00E5BE]" />
+                    4. Random Forest Tree Ensemble (No Epochs)
+                  </p>
+                  <p className="text-slate-400">
+                    RandomForestRegressor is an ensemble of 100 decision trees (<code>n_estimators = 100</code>). Unlike neural networks, decision trees do not iterate through training epochs or use gradient descent. Instead, each tree is fitted on bootstrap samples with random feature subsampling to minimize variance without overfitting.
+                  </p>
+
+                  {forecastState.featureImportances && Object.keys(forecastState.featureImportances).length > 0 && (
+                    <div className="mt-3 pt-2 border-t border-slate-800">
+                      <span className="text-[11px] font-bold text-white block mb-2">
+                        100-Tree Random Forest Gini Feature Importances (Sums to 100%):
+                      </span>
+                      <div className="space-y-1.5">
+                        {Object.entries(forecastState.featureImportances).map(([feat, imp]) => {
+                          const pct = Math.round(Number(imp) * 1000) / 10;
+                          return (
+                            <div key={feat} className="flex items-center gap-2 text-[11px]">
+                              <span className="w-28 text-slate-300 font-mono truncate">{feat}</span>
+                              <div className="flex-1 bg-slate-800 rounded-full h-2 overflow-hidden">
+                                <div
+                                  className="bg-[#00E5BE] h-full rounded-full transition-all"
+                                  style={{ width: `${Math.min(100, Math.max(3, pct))}%` }}
+                                />
+                              </div>
+                              <span className="w-12 text-right text-slate-400 font-medium tabular-nums">{pct}%</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
