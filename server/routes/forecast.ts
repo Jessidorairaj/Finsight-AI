@@ -47,9 +47,12 @@ forecastRouter.get('/', async (req: Request, res: Response) => {
     }
 
     // Retrieve user transactions from PostgreSQL
+    console.log(`[FORECAST] Route GET /api/forecast triggered for user ${userId} (horizon: ${forecastHorizon})`);
     const transactions = await getAllTransactions(userId, 5000);
+    console.log(`[FORECAST] Retrieved ${transactions.length} personal transactions from PostgreSQL for user ${userId}`);
 
     const forecastResult = await generateUserForecast(transactions, forecastHorizon, targetEnd, currentMonth);
+    console.log(`[FORECAST] Route GET /api/forecast dispatching payload to frontend (engineUsed: ${forecastResult.engineUsed}, modelUsed: ${forecastResult.modelUsed})`);
     res.json(forecastResult);
   } catch (error: any) {
     console.error('[Forecast Route Error]:', error);

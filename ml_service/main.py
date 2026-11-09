@@ -33,23 +33,17 @@ app.add_middleware(
 )
 
 
-class TransactionItem(BaseModel):
-    id: Optional[str] = None
-    date: str
-    amount: float
-    type: str
-    category: Optional[str] = None
-    status: Optional[str] = "Completed"
-    name: Optional[str] = None
-
-
 class ForecastRequest(BaseModel):
-    transactions: List[TransactionItem]
+    transactions: List[Dict[str, Any]]
     forecastHorizon: Optional[int] = Field(default=4, ge=1, le=12)
+    targetEnd: Optional[Any] = None
+    currentMonth: Optional[Any] = None
 
 
 @app.get("/health")
 def health_check():
+    sys.stderr.write("[FORECAST] FastAPI /health check queried\n")
+    sys.stderr.flush()
     return {
         "status": "ok",
         "service": "FinSight AI ML Forecasting Service",
@@ -70,10 +64,30 @@ def health_check():
 @app.post("/forecast")
 def create_forecast(req: ForecastRequest):
     try:
-        tx_dicts = [tx.model_dump() for tx in req.transactions]
-        result = run_forecasting_pipeline(tx_dicts, forecast_horizon=req.forecastHorizon)
+        sys.stderr.write(f"[FORECAST] FastAPI /forecast received request with {len(req.transactions)} transactions\n")
+        sys.stderr.flush()
+        target_end = None
+        if req.targetEnd and isinstance(req.targetEnd, (list, tuple)) and len(req.targetEnd) == 2:
+            target_end = (int(req.targetEnd[0]), int(req.targetEnd[1]))
+
+        current_ym = None
+        if req.currentMonth:
+            if isinstance(req.currentMonth, (list, tuple)) and len(req.currentMonth) == 2:
+                current_ym = (int(req.currentMonth[0]), int(req.currentMonth[1]))
+            elif isinstance(req.currentMonth, str) and '-' in req.currentMonth:
+                parts = req.currentMonth.split('-')
+                current_ym = (int(parts[0]), int(parts[1]))
+
+        result = run_forecasting_pipeline(
+            req.transactions,
+            forecast_horizon=req.forecastHorizon,
+            target_end_year_month=target_end,
+            current_year_month=current_ym
+        )
         return result
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 

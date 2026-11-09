@@ -33,6 +33,12 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import RandomForestRegressor
+
+
+def log_diagnostic(msg: str):
+    """Writes diagnostic logs to sys.stderr so stdout remains valid JSON for the caller."""
+    sys.stderr.write(f"{msg}\n")
+    sys.stderr.flush()
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
@@ -314,6 +320,8 @@ def run_forecasting_pipeline(
     6. Evaluates selected model on the held-out test partition.
     7. Retrains on all completed months and produces multi-step forward predictions starting at the current month.
     """
+    log_diagnostic(f"[FORECAST] Python forecasting engine received request ({len(transactions)} transactions, horizon: {forecast_horizon})")
+
     # Detect current calendar month using server time or explicit input
     if current_year_month is None:
         now = datetime.now()
@@ -325,11 +333,13 @@ def run_forecasting_pipeline(
         target_end_year_month=target_end_year_month
     )
     num_completed_months = len(df_monthly)
+    log_diagnostic(f"[FORECAST] Aggregated into {num_completed_months} completed historical monthly spending periods")
 
     # Minimum completed historical months constraint:
     # Requires at least 3 initial training months + 2 rolling validation folds + 1 test month = 6 months
     MIN_REQUIRED_MONTHS = 6
     if num_completed_months < MIN_REQUIRED_MONTHS:
+        log_diagnostic(f"[FORECAST] Insufficient data: {num_completed_months} completed months available (minimum required: {MIN_REQUIRED_MONTHS})")
         return {
             "status": "insufficient_data",
             "completedMonthsCount": num_completed_months,
@@ -345,7 +355,8 @@ def run_forecasting_pipeline(
                 for _, row in df_monthly.iterrows()
             ] if num_completed_months > 0 else [],
             "message": f"FinSight AI requires at least {MIN_REQUIRED_MONTHS} completed historical months to perform rolling-origin chronological validation and hold out an unseen test set (currently {num_completed_months} completed months available). Current month spending is tracked separately as month-to-date actuals.",
-            "modelsCompared": []
+            "modelsCompared": [],
+            "engineUsed": "scikit-learn"
         }
 
     # Extract historical actuals array preserving zero-expense indicators
@@ -442,6 +453,7 @@ def run_forecasting_pipeline(
         fold_sq_lr: List[float] = []
         fold_sq_rf: List[float] = []
 
+        log_diagnostic(f"[FORECAST] Starting rolling-origin chronological validation across {len(rolling_folds)} historical folds...")
         for origin in rolling_folds:
             y_target = series_amounts[origin]
 
@@ -472,6 +484,7 @@ def run_forecasting_pipeline(
             X_rf_fold = df_train_fold[feature_cols_rf].fillna(0.0).values
             y_train_fold = df_train_fold['amount'].values
 
+            log_diagnostic(f"[FORECAST] Random Forest validation fold training: fitting fold origin index {origin} (samples: {len(X_rf_fold)})")
             rf_fold_model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=42).fit(X_rf_fold, y_train_fold)
 
             # Target feature vector at origin
@@ -515,6 +528,7 @@ def run_forecasting_pipeline(
 
         ranked_models = sorted(list(val_maes.keys()), key=model_selection_sort_key)
         best_model_name = ranked_models[0]
+        log_diagnostic(f"[FORECAST] Rolling-origin validation completed. Selected best model: '{best_model_name}' (Validation MAE: {val_maes[best_model_name]:.2f})")
 
         all_models_validation = {
             m_name: {
@@ -531,6 +545,7 @@ def run_forecasting_pipeline(
     # -------------------------------------------------------------------------
     # STEP 2: HELD-OUT TEST EVALUATION (Untouched Until Selected Model Is Fixed)
     # -------------------------------------------------------------------------
+    log_diagnostic(f"[FORECAST] Step 2: Evaluating models on held-out test partition ({test_size} test months: {df_monthly['year_month'].iloc[test_start]} to {df_monthly['year_month'].iloc[test_end - 1]})")
     test_indices = list(range(test_start, test_end))
     y_test = series_amounts[test_start:test_end]
 
@@ -547,7 +562,9 @@ def run_forecasting_pipeline(
     X_rf_pre_test = df_pre_test[feature_cols_rf].fillna(0.0).values
     y_train_pre_test = df_pre_test['amount'].values
 
+    log_diagnostic(f"[FORECAST] Random Forest held-out test training started (samples: {len(X_rf_pre_test)}, estimators: 100)")
     rf_test_model = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42).fit(X_rf_pre_test, y_train_pre_test)
+    log_diagnostic(f"[FORECAST] Random Forest held-out test training completed (fitted estimators: {len(rf_test_model.estimators_)})")
 
     # 1. Naive Baseline test predictions
     test_preds_naive = np.array([series_amounts[i - 1] for i in test_indices])
@@ -631,6 +648,7 @@ def run_forecasting_pipeline(
     # -------------------------------------------------------------------------
     # STEP 3: FULL RETRAINING & MULTI-STEP FORWARD PROJECTIONS
     # -------------------------------------------------------------------------
+    log_diagnostic(f"[FORECAST] Step 3: Full retraining across all {num_completed_months} completed historical months")
     # Retrain ML models on ALL completed historical months
     X_full_lr = df_feat[feature_cols_lr].values
     y_full_lr = df_feat['amount'].values
@@ -643,13 +661,15 @@ def run_forecasting_pipeline(
     X_full_rf = df_feat.iloc[full_mask][feature_cols_rf].fillna(0.0).values
     y_full = df_feat.iloc[full_mask]['amount'].values
 
+    log_diagnostic(f"[FORECAST] Random Forest full model training started (samples: {len(X_full_rf)}, estimators: 100)")
     fitted_rf_full = RandomForestRegressor(n_estimators=100, max_depth=3, random_state=42).fit(X_full_rf, y_full)
+    log_diagnostic(f"[FORECAST] Random Forest full model training completed (fitted estimators: {len(fitted_rf_full.estimators_)})")
 
     # Estimate residual standard error from the best model fits on completed data
     if best_model_name == 'Random Forest Regression':
         full_resids = y_full - fitted_rf_full.predict(X_full_rf)
     elif best_model_name == 'Linear Regression':
-        full_resids = y_full - fitted_lr_full.predict(X_full_lr)
+        full_resids = y_full_lr - fitted_lr_full.predict(X_full_lr)
     elif best_model_name == 'Moving Average (3-Month)':
         full_resids = y_test - test_preds_ma
     else:
@@ -687,7 +707,7 @@ def run_forecasting_pipeline(
             feat_vec = np.array([[t_idx, lag1, lag2, rolling3, m_sin, m_cos]])
             pred_val = float(fitted_rf_full.predict(feat_vec)[0])
         elif best_model_name == 'Linear Regression':
-            feat_vec = np.array([[t_idx, lag1, lag2, rolling3]])
+            feat_vec = np.array([[t_idx]])
             pred_val = float(fitted_lr_full.predict(feat_vec)[0])
         elif best_model_name == 'Moving Average (3-Month)':
             pred_val = rolling3
@@ -732,7 +752,7 @@ def run_forecasting_pipeline(
         "selectionCriterion": "Rolling-origin chronological validation average MAE (test set held out strictly for final evaluation)"
     }
 
-    return {
+    result = {
         "status": "ok",
         "modelUsed": best_model_name,
         "forecastHorizon": forecast_horizon,
@@ -764,8 +784,12 @@ def run_forecasting_pipeline(
             "zeroExpenseMonthsCount": int(np.sum(df_monthly['amount'] == 0.0))
         },
         "evaluationSplitSummary": split_summary,
-        "architecturalNotes": "LSTM sequence model excluded by design: Personal expense time series with N < 50 data points exhibit severe overfitting and stochastic instability with deep recurrent architectures. Tabular lag regression with regularized Ridge and Random Forest models with rolling-origin chronological validation ensures deterministic convergence, superior generalization, and explainable feature attributions."
+        "architecturalNotes": "LSTM sequence model excluded by design: Personal expense time series with N < 50 data points exhibit severe overfitting and stochastic instability with deep recurrent architectures. Tabular lag regression with regularized Ridge and Random Forest models with rolling-origin chronological validation ensures deterministic convergence, superior generalization, and explainable feature attributions.",
+        "engineUsed": "scikit-learn"
     }
+
+    log_diagnostic(f"[FORECAST] Python forecasting pipeline completed successfully (Selected Model: '{best_model_name}', Engine: scikit-learn)")
+    return result
 
 
 def main():
@@ -813,10 +837,12 @@ def main():
         print(json.dumps(result, indent=2))
     except Exception as e:
         import traceback
+        tb = traceback.format_exc()
+        log_diagnostic(f"[FORECAST ERROR] Python exception in forecast_engine: {str(e)}\n{tb}")
         err_response = {
             "status": "error",
             "error": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": tb
         }
         print(json.dumps(err_response))
         sys.exit(1)

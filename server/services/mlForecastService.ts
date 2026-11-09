@@ -115,7 +115,7 @@ export interface ForecastResponse {
   evaluationSplitSummary?: EvaluationSplitSummary;
   message?: string;
   architecturalNotes?: string;
-  engineUsed?: 'python-fastapi' | 'python-subprocess' | 'typescript-fallback';
+  engineUsed?: 'scikit-learn' | 'python-fastapi' | 'python-subprocess' | 'typescript-fallback' | string;
 }
 
 const FASTAPI_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000/forecast';
@@ -137,6 +137,7 @@ async function callFastApi(
   currentMonth?: [number, number] | string
 ): Promise<ForecastResponse | null> {
   try {
+    console.log(`[FORECAST] Checking FastAPI forecasting service at ${FASTAPI_URL}...`);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 1500);
 
@@ -149,32 +150,47 @@ async function callFastApi(
     clearTimeout(timeoutId);
 
     if (res.ok) {
+      console.log(`[FORECAST] Python service reachable (FastAPI microservice status ${res.status})`);
       const data = (await res.json()) as ForecastResponse;
-      data.engineUsed = 'python-fastapi';
+      data.engineUsed = data.engineUsed || 'scikit-learn';
+      console.log(`[FORECAST] Python forecast response received from FastAPI`);
       return data;
     }
+    console.log(`[FORECAST] FastAPI service returned HTTP ${res.status}`);
     return null;
-  } catch {
+  } catch (err: any) {
+    console.log(`[FORECAST] FastAPI service not reachable (${err?.message || 'connection failed'}) - switching to Python subprocess`);
     return null;
   }
 }
 
 /**
- * Finds the Python binary on the local system.
+ * Finds the Python binary and environment on the local system.
  */
-function resolvePythonBinary(): { pythonBin: string; pythonHome?: string } {
+function resolvePythonBinary(): { pythonBin: string; pythonHome?: string; pythonPath?: string } {
   const candidateBins = [
-    { bin: 'C:\\Python314\\python.exe', home: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314' },
-    { bin: process.env.PYTHON_BIN || 'python', home: process.env.PYTHONHOME },
+    {
+      bin: 'C:\\Python314\\python.exe',
+      home: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
+      path: [
+        'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
+        'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
+      ].join(path.delimiter),
+    },
+    {
+      bin: process.env.PYTHON_BIN || 'python',
+      home: process.env.PYTHONHOME,
+      path: process.env.PYTHONPATH,
+    },
   ];
 
   for (const c of candidateBins) {
     if (fs.existsSync(c.bin)) {
-      return { pythonBin: c.bin, pythonHome: c.home };
+      return { pythonBin: c.bin, pythonHome: c.home, pythonPath: c.path };
     }
   }
 
-  return { pythonBin: 'python', pythonHome: undefined };
+  return { pythonBin: 'python', pythonHome: undefined, pythonPath: undefined };
 }
 
 /**
@@ -188,7 +204,7 @@ function callPythonSubprocess(
 ): Promise<ForecastResponse | null> {
   return new Promise(resolve => {
     try {
-      const { pythonBin, pythonHome } = resolvePythonBinary();
+      const { pythonBin, pythonHome, pythonPath } = resolvePythonBinary();
       const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
 
       if (!fs.existsSync(scriptPath)) {
@@ -200,6 +216,18 @@ function callPythonSubprocess(
         env.PYTHONHOME = pythonHome;
       }
 
+      const projectRoot = process.cwd();
+      const paths = [projectRoot, path.join(projectRoot, 'ml_service')];
+      if (pythonPath) {
+        paths.push(pythonPath);
+      }
+      if (env.PYTHONPATH) {
+        paths.push(env.PYTHONPATH);
+      }
+      env.PYTHONPATH = paths.join(path.delimiter);
+
+      console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${pythonBin})...`);
+
       const proc = spawn(pythonBin, [scriptPath, '-'], { env });
 
       let stdout = '';
@@ -210,36 +238,52 @@ function callPythonSubprocess(
       });
 
       proc.stderr.on('data', d => {
-        stderr += d.toString();
+        const text = d.toString();
+        stderr += text;
+        const lines = text.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            console.log(trimmed);
+          }
+        }
       });
 
       const timer = setTimeout(() => {
+        console.error('[FORECAST ERROR] Python subprocess timed out after 30000ms');
         proc.kill();
         resolve(null);
-      }, 7000);
+      }, 30000);
 
       proc.on('close', code => {
         clearTimeout(timer);
         if (code === 0 && stdout.trim()) {
           try {
             const parsed = JSON.parse(stdout) as ForecastResponse;
-            parsed.engineUsed = 'python-subprocess';
+            parsed.engineUsed = parsed.engineUsed || 'scikit-learn';
+            console.log(`[FORECAST] Python forecast response received from subprocess`);
             return resolve(parsed);
-          } catch {
+          } catch (jsonErr: any) {
+            console.error('[FORECAST ERROR] Failed to parse Python subprocess JSON output:', jsonErr?.message);
             return resolve(null);
           }
+        }
+        if (code !== 0) {
+          console.error(`[FORECAST ERROR] Python subprocess exited with code ${code}. Stderr:\n${stderr.trim()}`);
         }
         resolve(null);
       });
 
-      proc.on('error', () => {
+      proc.on('error', (err) => {
         clearTimeout(timer);
+        console.error('[FORECAST ERROR] Failed to spawn Python process:', err.message);
         resolve(null);
       });
 
       proc.stdin.write(JSON.stringify({ transactions, forecastHorizon, targetEnd, currentMonth }));
       proc.stdin.end();
-    } catch {
+    } catch (err) {
+      console.error('[ML Subprocess Catch Error]', err);
       resolve(null);
     }
   });
@@ -879,18 +923,29 @@ export async function generateUserForecast(
   targetEnd?: [number, number],
   currentMonth?: [number, number] | string
 ): Promise<ForecastResponse> {
+  console.log(`[FORECAST] Initiating forecast pipeline for ${transactions.length} user transactions...`);
+
   // Tier 1: Try Python FastAPI service if running
   const apiResult = await callFastApi(transactions, forecastHorizon, targetEnd, currentMonth);
   if (apiResult) {
+    console.log(`[FORECAST] Python forecast response received (FastAPI, status: ${apiResult.status}, modelUsed: ${apiResult.modelUsed})`);
+    console.log(`[FORECAST] Engine used: ${apiResult.engineUsed}`);
+    console.log(`[FORECAST] TypeScript fallback: NOT USED`);
     return apiResult;
   }
 
   // Tier 2: Try Python subprocess directly with scikit-learn
   const subprocessResult = await callPythonSubprocess(transactions, forecastHorizon, targetEnd, currentMonth);
   if (subprocessResult) {
+    console.log(`[FORECAST] Python forecast response received (Subprocess, status: ${subprocessResult.status}, modelUsed: ${subprocessResult.modelUsed})`);
+    console.log(`[FORECAST] Engine used: ${subprocessResult.engineUsed}`);
+    console.log(`[FORECAST] TypeScript fallback: NOT USED`);
     return subprocessResult;
   }
 
   // Tier 3: High-availability mathematical TypeScript fallback
-  return computeFallbackForecast(transactions, forecastHorizon, targetEnd, currentMonth);
+  console.warn(`[FORECAST] TypeScript fallback: INVOKED (Python FastAPI and subprocess were unavailable)`);
+  const fallbackResult = computeFallbackForecast(transactions, forecastHorizon, targetEnd, currentMonth);
+  console.log(`[FORECAST] Engine used: ${fallbackResult.engineUsed}`);
+  return fallbackResult;
 }

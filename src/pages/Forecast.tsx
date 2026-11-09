@@ -159,13 +159,22 @@ export const Forecast: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
+      console.log('[FORECAST] Retrain Pipeline clicked, requesting /api/forecast...');
       const res = await api.getForecast(4);
       if (res.success && res.data) {
+        console.log('[FORECAST] Response received in UI:', {
+          status: res.data.status,
+          modelUsed: res.data.modelUsed,
+          engineUsed: res.data.engineUsed,
+          evaluationMetrics: res.data.evaluationMetrics,
+        });
         setForecastState(res.data);
       } else {
+        console.error('[FORECAST ERROR] Retrain Pipeline returned error:', res.error);
         setError(res.error || 'Failed to fetch ML forecast.');
       }
     } catch (err: any) {
+      console.error('[FORECAST ERROR] Retrain Pipeline exception:', err);
       setError(err?.message || 'Error connecting to forecast service.');
     } finally {
       setLoading(false);
@@ -356,14 +365,38 @@ export const Forecast: React.FC = () => {
 
   const nextMonthPrediction = forecastState?.predictions?.[0];
 
+  // Calculation of Prediction Accuracy Percentage derived from Held-Out Test MAPE:
+  // Accuracy (%) = 100 - MAPE (%)
+  // Edge cases:
+  // - null/undefined MAPE (e.g. all test months had zero expenses) -> 'N/A'
+  // - MAPE > 100% -> '0.00%' (capped at 0.00% rather than negative percentages)
+  // - MAPE == 0% -> '100.00%'
+  // - formatted to two decimal places
+  const predictionAccuracyInfo = useMemo(() => {
+    const mape = forecastState?.evaluationMetrics?.mape;
+    if (mape === null || mape === undefined || isNaN(mape)) {
+      return {
+        display: 'N/A',
+        value: null,
+        subtitle: 'Zero actuals in test period (MAPE undefined)',
+      };
+    }
+    const rawAccuracy = 100 - mape;
+    const boundedAccuracy = Math.max(0, Math.min(100, Math.round(rawAccuracy * 100) / 100));
+    return {
+      display: `${boundedAccuracy.toFixed(2)}%`,
+      value: boundedAccuracy,
+      subtitle: `Derived from ${forecastState?.evaluationMetrics?.mapeObservationsUsed || 0} evaluated test months`,
+    };
+  }, [forecastState?.evaluationMetrics]);
+
   return (
     <div className="space-y-6">
       {/* Loading State */}
       {loading && (
         <div
-          className={`p-8 rounded-2xl border flex flex-col items-center justify-center gap-3 ${
-            isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200'
-          }`}
+          className={`p-8 rounded-2xl border flex flex-col items-center justify-center gap-3 ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200'
+            }`}
         >
           <RefreshCw className="w-8 h-8 text-[#00E5BE] animate-spin" />
           <p className="text-sm font-semibold">Training and evaluating ML forecasting models...</p>
@@ -374,9 +407,8 @@ export const Forecast: React.FC = () => {
       {/* Error State */}
       {!loading && error && (
         <div
-          className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${
-            isDark ? 'bg-rose-950/30 border-rose-800 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-900'
-          }`}
+          className={`p-4 rounded-2xl border flex items-center justify-between gap-4 ${isDark ? 'bg-rose-950/30 border-rose-800 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-900'
+            }`}
         >
           <div className="flex items-center gap-3">
             <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />
@@ -398,11 +430,10 @@ export const Forecast: React.FC = () => {
       {/* Insufficient Data State */}
       {!loading && !error && forecastState?.status === 'insufficient_data' && (
         <div
-          className={`p-5 rounded-2xl border space-y-4 ${
-            isDark
+          className={`p-5 rounded-2xl border space-y-4 ${isDark
               ? 'bg-[#0f1a2e] border-amber-500/30 text-amber-200'
               : 'bg-amber-50 border-amber-200 text-amber-900 shadow-sm'
-          }`}
+            }`}
         >
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -454,7 +485,10 @@ export const Forecast: React.FC = () => {
               <div className="flex items-center gap-2">
                 <Sparkles className="w-5 h-5 text-[#00E5BE]" />
                 <h2 className="text-lg font-bold tracking-tight">Machine Learning Expense Forecast</h2>
-                <span className="text-[10px] px-2 py-0.5 rounded-full font-bold bg-[#00E5BE]/20 text-[#00E5BE]">
+                <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider ${forecastState.engineUsed === 'typescript-fallback'
+                    ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                    : 'bg-[#00E5BE]/20 text-[#00E5BE] border border-[#00E5BE]/30'
+                  }`}>
                   {forecastState.engineUsed || 'scikit-learn'}
                 </span>
               </div>
@@ -475,11 +509,10 @@ export const Forecast: React.FC = () => {
           {/* Month-To-Date (MTD) Current In-Progress Month Context */}
           {forecastState.currentMonthMtd && (
             <div
-              className={`p-3.5 rounded-xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs ${
-                isDark
+              className={`p-3.5 rounded-xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs ${isDark
                   ? 'bg-cyan-950/20 border-cyan-500/30 text-slate-300'
                   : 'bg-cyan-50 border-cyan-200 text-slate-800'
-              }`}
+                }`}
             >
               <div className="flex items-center gap-2.5">
                 <Calendar className="w-4 h-4 text-cyan-400 shrink-0" />
@@ -498,13 +531,12 @@ export const Forecast: React.FC = () => {
             </div>
           )}
 
-          {/* 1. Main Forecast Summary: 4 Compact KPI Cards */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* 1. Main Forecast Summary: 5 Compact KPI Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
             {/* KPI 1: Selected Forecasting Model */}
             <div
-              className={`p-4 rounded-xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-4 rounded-xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -531,9 +563,8 @@ export const Forecast: React.FC = () => {
 
             {/* KPI 2: Next-Month Predicted Expense */}
             <div
-              className={`p-4 rounded-xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-4 rounded-xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -560,9 +591,8 @@ export const Forecast: React.FC = () => {
 
             {/* KPI 3: Held-Out Test MAE */}
             <div
-              className={`p-4 rounded-xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-4 rounded-xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -585,11 +615,10 @@ export const Forecast: React.FC = () => {
               </p>
             </div>
 
-            {/* KPI 4: Held-Out Test MAPE (Strictly not labeled as accuracy) */}
+            {/* KPI 4: Held-Out Test MAPE (Prediction Error) */}
             <div
-              className={`p-4 rounded-xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-4 rounded-xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-1">
@@ -606,11 +635,11 @@ export const Forecast: React.FC = () => {
               </div>
               <p className="text-lg font-bold text-white">
                 {forecastState.evaluationMetrics?.mape !== null && forecastState.evaluationMetrics?.mape !== undefined
-                  ? `${forecastState.evaluationMetrics.mape}%`
+                  ? `${forecastState.evaluationMetrics.mape.toFixed(2)}%`
                   : 'N/A'}
               </p>
               <p className="text-[11px] text-sky-300 font-medium mt-1">
-                Percentage Deviation
+                Prediction Error (MAPE)
               </p>
               <p className="text-[10px] text-slate-400 mt-0.5">
                 {forecastState.evaluationMetrics?.mape !== null && forecastState.evaluationMetrics?.mape !== undefined
@@ -618,13 +647,44 @@ export const Forecast: React.FC = () => {
                   : 'Zero actuals excluded (undefined percentage)'}
               </p>
             </div>
+
+            {/* KPI 5: Prediction Accuracy Percentage (100% - MAPE) */}
+            <div
+              className={`p-4 rounded-xl border transition-all ${isDark ? 'bg-[#0f1a2e] border-emerald-500/40' : 'bg-white border-emerald-300 shadow-sm'
+                }`}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-1">
+                  <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                    Prediction Accuracy
+                  </span>
+                  <span title="Calculated as 100% minus MAPE. This is an indicative error-based prediction score, not a guarantee of future prediction correctness.">
+                    <HelpCircle className="w-3.5 h-3.5 text-emerald-400 cursor-help" />
+                  </span>
+                </div>
+                <div className="w-7 h-7 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                  <CheckCircle2 className="w-4 h-4" />
+                </div>
+              </div>
+              <p className="text-lg font-bold text-emerald-400">
+                {predictionAccuracyInfo.display}
+              </p>
+              <p className="text-[11px] text-emerald-300 font-medium mt-1">
+                Prediction Accuracy Score
+              </p>
+              <p
+                className="text-[10px] text-slate-400 mt-0.5 truncate"
+                title="Calculated as 100% minus MAPE. This is an indicative error-based prediction score, not a guarantee of future prediction correctness."
+              >
+                100% − MAPE test evaluation score
+              </p>
+            </div>
           </div>
 
           {/* 2. Actual vs. Predicted Visualization (Chart) */}
           <div
-            className={`p-6 rounded-2xl border ${
-              isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-            }`}
+            className={`p-6 rounded-2xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+              }`}
           >
             <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
               <div>
@@ -750,9 +810,8 @@ export const Forecast: React.FC = () => {
 
           {/* 3. Actual vs. Predicted Table */}
           <div
-            className={`p-6 rounded-2xl border ${
-              isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-            }`}
+            className={`p-6 rounded-2xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+              }`}
           >
             <div className="flex items-center justify-between mb-4">
               <div>
@@ -771,9 +830,8 @@ export const Forecast: React.FC = () => {
 
             <div className="overflow-x-auto">
               <table className="w-full text-xs text-left">
-                <thead className={`text-[11px] uppercase tracking-wider font-semibold border-b ${
-                  isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'
-                }`}>
+                <thead className={`text-[11px] uppercase tracking-wider font-semibold border-b ${isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'
+                  }`}>
                   <tr>
                     <th className="py-2.5 px-3">Month</th>
                     <th className="py-2.5 px-3">Evaluation Phase</th>
@@ -793,19 +851,17 @@ export const Forecast: React.FC = () => {
                     return (
                       <tr
                         key={row.rawMonth}
-                        className={`transition-colors ${
-                          isDark ? 'hover:bg-slate-800/30' : 'hover:bg-slate-50'
-                        } ${isTest ? (isDark ? 'bg-amber-950/10' : 'bg-amber-50/50') : ''}`}
+                        className={`transition-colors ${isDark ? 'hover:bg-slate-800/30' : 'hover:bg-slate-50'
+                          } ${isTest ? (isDark ? 'bg-amber-950/10' : 'bg-amber-50/50') : ''}`}
                       >
                         <td className="py-2.5 px-3 font-semibold text-white">
                           {row.month}
                         </td>
                         <td className="py-2.5 px-3">
-                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                            isTest
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold ${isTest
                               ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                               : 'bg-[#00E5BE]/10 text-[#00E5BE] border border-[#00E5BE]/30'
-                          }`}>
+                            }`}>
                             {row.phase}
                           </span>
                         </td>
@@ -841,9 +897,8 @@ export const Forecast: React.FC = () => {
 
           {/* 4. Simplified Model Comparison Table */}
           <div
-            className={`p-6 rounded-2xl border ${
-              isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-            }`}
+            className={`p-6 rounded-2xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+              }`}
           >
             <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
               <div>
@@ -866,14 +921,14 @@ export const Forecast: React.FC = () => {
             {forecastState.allModelsEvaluation && (
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left">
-                  <thead className={`text-[11px] uppercase tracking-wider font-semibold border-b ${
-                    isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'
-                  }`}>
+                  <thead className={`text-[11px] uppercase tracking-wider font-semibold border-b ${isDark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'
+                    }`}>
                     <tr>
                       <th className="py-2.5 px-3">Model</th>
                       <th className="py-2.5 px-3 text-right">Test MAE</th>
                       <th className="py-2.5 px-3 text-right">Test RMSE</th>
                       <th className="py-2.5 px-3 text-right">Test MAPE</th>
+                      <th className="py-2.5 px-3 text-right">Prediction Accuracy</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-inherit">
@@ -882,15 +937,14 @@ export const Forecast: React.FC = () => {
                       return (
                         <tr
                           key={mName}
-                          className={`transition-colors ${
-                            isSelected
+                          className={`transition-colors ${isSelected
                               ? isDark
                                 ? 'bg-[#00E5BE]/10 font-medium text-white'
                                 : 'bg-emerald-50/70 font-medium text-slate-900'
                               : isDark
-                              ? 'hover:bg-slate-800/30 text-slate-300'
-                              : 'hover:bg-slate-50 text-slate-700'
-                          }`}
+                                ? 'hover:bg-slate-800/30 text-slate-300'
+                                : 'hover:bg-slate-50 text-slate-700'
+                            }`}
                         >
                           <td className="py-2.5 px-3 flex items-center gap-2 font-semibold">
                             <span>{mName}</span>
@@ -909,13 +963,22 @@ export const Forecast: React.FC = () => {
                           <td className="py-2.5 px-3 text-right">
                             {metrics.mape !== null && metrics.mape !== undefined ? (
                               <span className="text-[#00E5BE] font-semibold">
-                                {metrics.mape}%{' '}
+                                {metrics.mape.toFixed(2)}%{' '}
                                 <span className="text-[10px] text-slate-400 font-normal">
                                   ({metrics.mapeObservationsUsed}/{metrics.mapeObservationsTotal})
                                 </span>
                               </span>
                             ) : (
                               <span className="text-amber-300 font-medium">N/A</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3 text-right">
+                            {metrics.mape !== null && metrics.mape !== undefined ? (
+                              <span className="text-emerald-400 font-semibold">
+                                {Math.max(0, Math.min(100, Math.round((100 - metrics.mape) * 100) / 100)).toFixed(2)}%
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 font-normal">N/A</span>
                             )}
                           </td>
                         </tr>
@@ -1014,9 +1077,8 @@ export const Forecast: React.FC = () => {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             {/* Interactive Scenario Sandbox */}
             <div
-              className={`p-6 rounded-2xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-6 rounded-2xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center gap-2 mb-1">
                 <Sliders className="w-5 h-5 text-[#00E5BE]" />
@@ -1086,9 +1148,8 @@ export const Forecast: React.FC = () => {
 
             {/* Model Architecture & Deep Learning Rationale */}
             <div
-              className={`p-6 rounded-2xl border ${
-                isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
-              }`}
+              className={`p-6 rounded-2xl border ${isDark ? 'bg-[#0f1a2e] border-[#1b2944]' : 'bg-white border-slate-200 shadow-sm'
+                }`}
             >
               <div className="flex items-center gap-2 mb-1">
                 <Cpu className="w-5 h-5 text-sky-400" />
