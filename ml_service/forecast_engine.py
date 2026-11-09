@@ -23,23 +23,48 @@ Validation Methodology:
 """
 
 import sys
+import os
+import site
 import json
 import math
 import re
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 
+# Ensure user site-packages and ~/.local directories are in sys.path
+try:
+    usp = site.getusersitepackages()
+    if isinstance(usp, str) and os.path.isdir(usp) and usp not in sys.path:
+        sys.path.insert(0, usp)
+    elif isinstance(usp, (list, tuple)):
+        for p in usp:
+            if os.path.isdir(p) and p not in sys.path:
+                sys.path.insert(0, p)
+except Exception:
+    pass
+
+try:
+    home = os.path.expanduser('~')
+    local_sp = os.path.join(home, '.local', 'lib')
+    if os.path.isdir(local_sp):
+        for entry in os.listdir(local_sp):
+            sp = os.path.join(local_sp, entry, 'site-packages')
+            if os.path.isdir(sp) and sp not in sys.path:
+                sys.path.insert(0, sp)
+except Exception:
+    pass
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 def log_diagnostic(msg: str):
     """Writes diagnostic logs to sys.stderr so stdout remains valid JSON for the caller."""
     sys.stderr.write(f"{msg}\n")
     sys.stderr.flush()
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 MONTH_NAMES = {
@@ -321,6 +346,7 @@ def run_forecasting_pipeline(
     7. Retrains on all completed months and produces multi-step forward predictions starting at the current month.
     """
     log_diagnostic(f"[FORECAST] Python forecasting engine received request ({len(transactions)} transactions, horizon: {forecast_horizon})")
+    log_diagnostic(f"[FORECAST] forecast_engine.py running on Python {sys.version.split()[0]} ({sys.executable})")
 
     # Detect current calendar month using server time or explicit input
     if current_year_month is None:
@@ -731,14 +757,10 @@ def run_forecasting_pipeline(
             "label": f"{ym_str} (Forecast)"
         })
 
-    # Feature importance extraction
+    # Feature importance extraction from 100-tree Random Forest ensemble
     feature_importance_dict = {}
-    if best_model_name == 'Random Forest Regression':
-        for feat_name, imp in zip(feature_cols_rf, fitted_rf_full.feature_importances_):
-            feature_importance_dict[feat_name] = round(float(imp), 4)
-    elif best_model_name == 'Linear Regression':
-        for feat_name, coef in zip(feature_cols_lr, fitted_lr_full.coef_):
-            feature_importance_dict[feat_name] = round(float(coef), 4)
+    for feat_name, imp in zip(feature_cols_rf, fitted_rf_full.feature_importances_):
+        feature_importance_dict[feat_name] = round(float(imp), 4)
 
     # Summary of evaluation split
     split_summary = {

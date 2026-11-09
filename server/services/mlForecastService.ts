@@ -180,89 +180,48 @@ async function callFastApi(
  * Resolves the appropriate Python binary for the current host environment
  * (Render Linux, local Windows, or custom virtualenv).
  */
-function resolvePythonBinary(): { pythonBin: string; pythonHome?: string; pythonPath?: string } {
-  // 1. Explicit user override via environment variable
-  if (process.env.PYTHON_BIN) {
-    return {
-      pythonBin: process.env.PYTHON_BIN,
-      pythonHome: process.env.PYTHONHOME,
-      pythonPath: process.env.PYTHONPATH,
-    };
-  }
-
-  // 2. Check local/virtualenv directories relative to project root
-  const projectRoot = process.cwd();
-  const venvPaths = [
-    path.join(projectRoot, '.venv', 'bin', 'python'),
-    path.join(projectRoot, '.venv', 'bin', 'python3'),
-    path.join(projectRoot, '.venv', 'Scripts', 'python.exe'),
-    '/opt/render/project/src/.venv/bin/python',
-    '/opt/render/project/src/.venv/bin/python3',
-  ];
-
-  for (const vp of venvPaths) {
-    if (fs.existsSync(vp)) {
-      return { pythonBin: vp };
-    }
-  }
-
-  // 3. Platform-specific resolution
-  if (process.platform === 'win32') {
-    const winDevPath = 'C:\\Python314\\python.exe';
-    if (fs.existsSync(winDevPath)) {
-      return {
-        pythonBin: winDevPath,
-        pythonHome: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
-        pythonPath: [
-          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
-          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
-        ].join(path.delimiter),
-      };
-    }
-    return { pythonBin: 'python' };
-  }
-
-  // 4. Linux / Render production resolution
-  const linuxBins = [
-    '/usr/bin/python3',
-    '/usr/local/bin/python3',
-    '/usr/bin/python',
-    'python3',
-    'python',
-  ];
-
-  for (const lb of linuxBins) {
-    if (path.isAbsolute(lb) && fs.existsSync(lb)) {
-      return { pythonBin: lb };
-    }
-  }
-
-  return { pythonBin: 'python3' };
-}
-
-interface PythonVerificationResult {
-  ok: boolean;
+interface VerifiedPythonEnvironment {
   pythonBin: string;
-  missingModules?: string[];
-  error?: string;
-  scikitLearnVersion?: string;
-  pandasVersion?: string;
-  numpyVersion?: string;
+  actualExecutable: string;
+  pythonVersion: string;
+  numpyVersion: string;
+  pandasVersion: string;
+  scikitLearnVersion: string;
+  pythonHome?: string;
+  pythonPath?: string;
 }
 
-let cachedVerification: { result: PythonVerificationResult; timestamp: number } | null = null;
+let cachedVerifiedEnv: { env: VerifiedPythonEnvironment; timestamp: number } | null = null;
 
 /**
- * Pre-flight verification that checks if required Python libraries (numpy, pandas, sklearn)
- * can be imported into the active Python environment before invoking the forecast engine.
+ * Pre-flight test script executed against candidate Python binaries.
+ * Ensures user site-packages and ~/.local directories are included,
+ * then checks imports for numpy, pandas, and scikit-learn.
  */
-function verifyPythonEnvironment(pythonBin: string, env: NodeJS.ProcessEnv): PythonVerificationResult {
-  const now = Date.now();
-  if (cachedVerification && (now - cachedVerification.timestamp < 30000)) {
-    return cachedVerification.result;
-  }
+const PYTHON_CHECK_CODE = `
+import sys, os, site
+try:
+    usp = site.getusersitepackages()
+    if isinstance(usp, str) and os.path.isdir(usp) and usp not in sys.path:
+        sys.path.insert(0, usp)
+    elif isinstance(usp, (list, tuple)):
+        for p in usp:
+            if os.path.isdir(p) and p not in sys.path:
+                sys.path.insert(0, p)
+except Exception:
+    pass
 
-  const checkCode = `import sys
+try:
+    home = os.path.expanduser('~')
+    local_sp = os.path.join(home, '.local', 'lib')
+    if os.path.isdir(local_sp):
+        for entry in os.listdir(local_sp):
+            sp = os.path.join(local_sp, entry, 'site-packages')
+            if os.path.isdir(sp) and sp not in sys.path:
+                sys.path.insert(0, sp)
+except Exception:
+    pass
+
 missing = []
 for mod in ['numpy', 'pandas', 'sklearn']:
     try:
@@ -271,66 +230,175 @@ for mod in ['numpy', 'pandas', 'sklearn']:
         missing.append(mod)
 
 if missing:
-    sys.stdout.write("MISSING:" + ",".join(missing) + "\\n")
+    sys.stderr.write("MISSING:" + ",".join(missing) + "\\n")
     sys.exit(1)
 else:
     import numpy, pandas, sklearn
-    sys.stdout.write("OK:" + str(numpy.__version__) + ":" + str(pandas.__version__) + ":" + str(sklearn.__version__) + "\\n")
+    ver = sys.version.split()[0]
+    sys.stdout.write(f"OK|||{sys.executable}|||{ver}|||{numpy.__version__}|||{pandas.__version__}|||{sklearn.__version__}\\n")
+    sys.exit(0)
 `;
 
-  try {
-    const res = spawnSync(pythonBin, ['-c', checkCode], {
-      env,
-      timeout: 5000,
-      encoding: 'utf8',
-    });
-
-    const stdout = (res.stdout || '').trim();
-    const stderr = (res.stderr || '').trim();
-
-    if (res.status === 0 && stdout.startsWith('OK:')) {
-      const parts = stdout.split(':');
-      const vResult: PythonVerificationResult = {
-        ok: true,
-        pythonBin,
-        numpyVersion: parts[1],
-        pandasVersion: parts[2],
-        scikitLearnVersion: parts[3],
-      };
-      cachedVerification = { result: vResult, timestamp: now };
-      return vResult;
-    }
-
-    let missingModules: string[] = [];
-    if (stdout.startsWith('MISSING:')) {
-      missingModules = stdout.replace('MISSING:', '').split(',');
-    } else if (stderr.includes('No module named')) {
-      const match = stderr.match(/No module named ['"]([^'"]+)['"]/);
-      if (match) missingModules = [match[1]];
-    }
-
-    const errMessage = stderr || stdout || (res.error ? res.error.message : 'Unknown Python verification failure');
-    const vResult: PythonVerificationResult = {
-      ok: false,
-      pythonBin,
-      missingModules,
-      error: errMessage,
-    };
-    cachedVerification = { result: vResult, timestamp: now };
-    return vResult;
-  } catch (err: any) {
-    const vResult: PythonVerificationResult = {
-      ok: false,
-      pythonBin,
-      error: err?.message || 'Failed to spawn Python verification process',
-    };
-    cachedVerification = { result: vResult, timestamp: now };
-    return vResult;
-  }
+interface PythonCandidate {
+  bin: string;
+  home?: string;
+  path?: string;
 }
 
 /**
- * Spawns python `ml_service/forecast_engine.py` via child process.
+ * Probes candidate Python executables across Render Linux, virtual environments,
+ * system PATH, and developer environments to find a genuine, working Scikit-learn interpreter.
+ */
+function findWorkingPythonEnvironment(): VerifiedPythonEnvironment | null {
+  const now = Date.now();
+  if (cachedVerifiedEnv && (now - cachedVerifiedEnv.timestamp < 60000)) {
+    return cachedVerifiedEnv.env;
+  }
+
+  const projectRoot = process.cwd();
+  const candidates: PythonCandidate[] = [];
+
+  // 1. Explicit user override via environment variable
+  if (process.env.PYTHON_BIN) {
+    candidates.push({
+      bin: process.env.PYTHON_BIN,
+      home: process.env.PYTHONHOME,
+      path: process.env.PYTHONPATH,
+    });
+  }
+
+  if (process.platform === 'win32') {
+    // Windows developer candidates
+    const winDevPath = 'C:\\Python314\\python.exe';
+    if (fs.existsSync(winDevPath)) {
+      candidates.push({
+        bin: winDevPath,
+        home: 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314',
+        path: [
+          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib',
+          'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages',
+        ].join(path.delimiter),
+      });
+    }
+    const appDataWin = 'C:\\Users\\Jessi\\AppData\\Local\\Programs\\Python\\Python314\\python.exe';
+    if (fs.existsSync(appDataWin)) {
+      candidates.push({ bin: appDataWin });
+    }
+    candidates.push({ bin: 'python' }, { bin: 'python3' }, { bin: 'py' });
+    candidates.push({ bin: path.join(projectRoot, '.venv', 'Scripts', 'python.exe') });
+  } else {
+    // Linux / Render production candidates
+    // 'python3' from PATH is candidate #1 because Render build commands
+    // (e.g. `python3 -m pip install -r requirements.txt`) execute the PATH's active Python.
+    candidates.push({ bin: 'python3' });
+    candidates.push({ bin: 'python' });
+
+    // Render / Pyenv / ASDF standard shims and virtual environments
+    candidates.push({ bin: '/home/render/.pyenv/shims/python3' });
+    candidates.push({ bin: '/opt/render/project/.pyenv/shims/python3' });
+    candidates.push({ bin: '/home/render/.pyenv/shims/python' });
+    candidates.push({ bin: '/opt/render/project/.pyenv/shims/python' });
+    candidates.push({ bin: '/root/.pyenv/shims/python3' });
+    candidates.push({ bin: path.join(projectRoot, '.venv', 'bin', 'python3') });
+    candidates.push({ bin: path.join(projectRoot, '.venv', 'bin', 'python') });
+    candidates.push({ bin: '/opt/render/project/src/.venv/bin/python3' });
+    candidates.push({ bin: '/opt/render/project/src/.venv/bin/python' });
+
+    // Host system Linux binaries
+    candidates.push({ bin: '/usr/local/bin/python3' });
+    candidates.push({ bin: '/usr/local/bin/python' });
+    candidates.push({ bin: '/usr/bin/python3' });
+    candidates.push({ bin: '/usr/bin/python' });
+  }
+
+  console.log(`[FORECAST] Searching for verified Python ML environment across ${candidates.length} candidate paths...`);
+
+  const diagnosticFailures: Array<{ bin: string; code: number | null; error: string }> = [];
+
+  for (const candidate of candidates) {
+    // If absolute path and does not exist on disk, skip without spawning
+    if (path.isAbsolute(candidate.bin) && !fs.existsSync(candidate.bin)) {
+      continue;
+    }
+
+    const testEnv: NodeJS.ProcessEnv = { ...process.env };
+    if (candidate.home) {
+      testEnv.PYTHONHOME = candidate.home;
+    }
+    const envPaths = [projectRoot, path.join(projectRoot, 'ml_service')];
+    if (candidate.path) {
+      envPaths.push(candidate.path);
+    }
+    if (testEnv.PYTHONPATH) {
+      envPaths.push(testEnv.PYTHONPATH);
+    }
+    testEnv.PYTHONPATH = envPaths.join(path.delimiter);
+
+    try {
+      const res = spawnSync(candidate.bin, ['-c', PYTHON_CHECK_CODE], {
+        env: testEnv,
+        timeout: 8000,
+        encoding: 'utf8',
+      });
+
+      const stdout = (res.stdout || '').trim();
+      const stderr = (res.stderr || '').trim();
+
+      if (res.status === 0 && stdout.startsWith('OK|||')) {
+        const parts = stdout.split('|||');
+        const resolvedActual = parts[1] || candidate.bin;
+        const pyVer = parts[2] || 'unknown';
+        const numVer = parts[3] || 'unknown';
+        const pdVer = parts[4] || 'unknown';
+        const skVer = parts[5] || 'unknown';
+
+        const verified: VerifiedPythonEnvironment = {
+          pythonBin: candidate.bin,
+          actualExecutable: resolvedActual,
+          pythonVersion: pyVer,
+          numpyVersion: numVer,
+          pandasVersion: pdVer,
+          scikitLearnVersion: skVer,
+          pythonHome: candidate.home,
+          pythonPath: candidate.path,
+        };
+
+        console.log(`[FORECAST] Verified working Python ML interpreter: '${candidate.bin}' -> ${resolvedActual}`);
+        console.log(`[FORECAST] Active Versions: Python ${pyVer}, NumPy ${numVer}, Pandas ${pdVer}, Scikit-Learn ${skVer}`);
+        cachedVerifiedEnv = { env: verified, timestamp: now };
+        return verified;
+      }
+
+      diagnosticFailures.push({
+        bin: candidate.bin,
+        code: res.status,
+        error: stderr || stdout || (res.error ? res.error.message : 'import failed'),
+      });
+    } catch (err: any) {
+      diagnosticFailures.push({
+        bin: candidate.bin,
+        code: null,
+        error: err?.message || 'spawn error',
+      });
+    }
+  }
+
+  // All candidates failed verification — log detailed diagnostic trace
+  console.error(`[FORECAST ERROR] All Python interpreter candidates failed ML dependency verification:`);
+  for (const failure of diagnosticFailures) {
+    console.error(`  - Candidate '${failure.bin}': exit code ${failure.code}, error: ${failure.error}`);
+  }
+  console.error(`[FORECAST ERROR] Current working directory: ${projectRoot}`);
+  console.error(`[FORECAST ERROR] System PATH: ${process.env.PATH || 'none'}`);
+  console.error(`[FORECAST ERROR] Platform: ${process.platform}, Arch: ${process.arch}, Node: ${process.version}`);
+  console.error(`[FORECAST ERROR] Render Deployment Fix: In Render Dashboard -> Settings -> Build Command, ensure:`);
+  console.error(`[FORECAST ERROR] -> python3 -m pip install -r requirements.txt && npm install && npm run build:server && npm run db:migrate`);
+
+  return null;
+}
+
+/**
+ * Spawns python `ml_service/forecast_engine.py` via child process using the verified Python environment.
  */
 function callPythonSubprocess(
   transactions: FrontendTransaction[],
@@ -340,48 +408,40 @@ function callPythonSubprocess(
 ): Promise<ForecastResponse | null> {
   return new Promise(resolve => {
     try {
-      const { pythonBin, pythonHome, pythonPath } = resolvePythonBinary();
-      const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
+      const verified = findWorkingPythonEnvironment();
+      if (!verified) {
+        console.warn(`[FORECAST] Python environment unavailable. Deferring to mathematical fallback.`);
+        return resolve(null);
+      }
 
+      const scriptPath = path.resolve(process.cwd(), 'ml_service', 'forecast_engine.py');
       if (!fs.existsSync(scriptPath)) {
         console.error(`[FORECAST ERROR] Forecast engine script not found at ${scriptPath}`);
         return resolve(null);
       }
 
       const env: NodeJS.ProcessEnv = { ...process.env };
-      if (pythonHome) {
-        env.PYTHONHOME = pythonHome;
+      if (verified.pythonHome) {
+        env.PYTHONHOME = verified.pythonHome;
       }
 
       const projectRoot = process.cwd();
       const paths = [projectRoot, path.join(projectRoot, 'ml_service')];
-      if (pythonPath) {
-        paths.push(pythonPath);
+      if (verified.pythonPath) {
+        paths.push(verified.pythonPath);
       }
       if (env.PYTHONPATH) {
         paths.push(env.PYTHONPATH);
       }
       env.PYTHONPATH = paths.join(path.delimiter);
 
-      // Verify that Python and required libraries (numpy, pandas, sklearn) can be imported
-      const verification = verifyPythonEnvironment(pythonBin, env);
-      if (!verification.ok) {
-        console.error(`[FORECAST ERROR] Python dependency check failed for interpreter '${pythonBin}':`);
-        if (verification.missingModules && verification.missingModules.length > 0) {
-          console.error(`[FORECAST ERROR] Missing Python modules: ${verification.missingModules.join(', ')}`);
-        }
-        if (verification.error) {
-          console.error(`[FORECAST ERROR] Diagnostic details: ${verification.error}`);
-        }
-        console.error(`[FORECAST ERROR] Render Deployment Fix: In Render Dashboard -> Settings -> Build Command, update to:`);
-        console.error(`[FORECAST ERROR] -> pip install -r requirements.txt && npm install && npm run build`);
-        return resolve(null);
-      }
+      console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${verified.pythonBin})...`);
+      console.log(`[FORECAST] Python Executable: ${verified.actualExecutable} (Python ${verified.pythonVersion})`);
+      console.log(`[FORECAST] Script Path: ${scriptPath} (exists: true)`);
+      console.log(`[FORECAST] Subprocess CWD: ${projectRoot}`);
+      console.log(`[FORECAST] Dependencies: NumPy ${verified.numpyVersion}, Pandas ${verified.pandasVersion}, Scikit-Learn ${verified.scikitLearnVersion}`);
 
-      console.log(`[FORECAST] Python ML environment verified (NumPy ${verification.numpyVersion}, Pandas ${verification.pandasVersion}, Scikit-Learn ${verification.scikitLearnVersion}) using interpreter: ${pythonBin}`);
-      console.log(`[FORECAST] Spawning Python scikit-learn forecasting subprocess (${pythonBin})...`);
-
-      const proc = spawn(pythonBin, [scriptPath, '-'], { env });
+      const proc = spawn(verified.pythonBin, [scriptPath, '-'], { env });
 
       let stdout = '';
       let stderr = '';
@@ -415,9 +475,13 @@ function callPythonSubprocess(
             const parsed = JSON.parse(stdout) as ForecastResponse;
             parsed.engineUsed = parsed.engineUsed || 'scikit-learn';
             console.log(`[FORECAST] Python forecast response received from subprocess`);
+            console.log(`[FORECAST] Engine used: ${parsed.engineUsed}`);
+            console.log(`[FORECAST] Model used: ${parsed.modelUsed}`);
+            console.log(`[FORECAST] TypeScript fallback: NOT USED`);
             return resolve(parsed);
           } catch (jsonErr: any) {
             console.error('[FORECAST ERROR] Failed to parse Python subprocess JSON output:', jsonErr?.message);
+            console.error('[FORECAST ERROR] Subprocess stdout was:', stdout.slice(0, 1000));
             return resolve(null);
           }
         }
